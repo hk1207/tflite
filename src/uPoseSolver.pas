@@ -59,6 +59,12 @@ type
 
   TKeypoints = array[0..KEYPOINT_COUNT - 1] of TKeypoint;
 
+  /// <summary>
+  /// 3D positions of the 17 keypoints in meters : +X to the right of the image,
+  /// +Y up, +Z to the camera. Models with 3D output (BlazePose) give them.
+  /// </summary>
+  TKeypoints3D = array[0..KEYPOINT_COUNT - 1] of TVec3;
+
   TJoint = (jPelvis, jChest, jHead,
             jLShoulder, jRShoulder, jLElbow, jRElbow, jLWrist, jRWrist,
             jLHip, jRHip, jLKnee, jRKnee, jLAnkle, jRAnkle);
@@ -95,7 +101,11 @@ type
     protected
       FFilterX   : array[0..KEYPOINT_COUNT - 1] of TOneEuroFilter;
       FFilterY   : array[0..KEYPOINT_COUNT - 1] of TOneEuroFilter;
+      FFilterWX  : array[0..KEYPOINT_COUNT - 1] of TOneEuroFilter;
+      FFilterWY  : array[0..KEYPOINT_COUNT - 1] of TOneEuroFilter;
+      FFilterWZ  : array[0..KEYPOINT_COUNT - 1] of TOneEuroFilter;
       FX, FY     : array[0..KEYPOINT_COUNT - 1] of Single;
+      FW         : TKeypoints3D;
       FSeen      : array[0..KEYPOINT_COUNT - 1] of boolean;
       FHasScale  : boolean;
       FScale     : Single;   // meters per pixel
@@ -106,6 +116,8 @@ type
       FLastPose  : TAvatarPose;
 
       function Limb(const aParent : TVec3; aParentIdx, aChildIdx : integer; aLen, aSign : Single) : TVec3;
+      function Dir3D(aFrom, aTo : integer) : TVec3;
+      function Limb3D(const aParent : TVec3; aFrom, aTo : integer; aLen : Single) : TVec3;
     public
       /// <summary>
       /// True if the camera image is shown as a mirror : the avatar then moves
@@ -133,6 +145,12 @@ type
       /// the time of the frame in seconds.
       /// </summary>
       function Solve(const aRaw : TKeypoints; aFrameW, aFrameH, aTime : Single) : TAvatarPose;
+      /// <summary>
+      /// Same as Solve, for models that measure the 3D positions (BlazePose) :
+      /// the depth and the turn of the body are measured, not estimated.
+      /// aWorld has the positions in meters (see TKeypoints3D).
+      /// </summary>
+      function Solve3D(const aRaw : TKeypoints; const aWorld : TKeypoints3D; aFrameW, aFrameH, aTime : Single) : TAvatarPose;
       property Scale : Single read FScale;
   end;
 
@@ -140,6 +158,8 @@ function Vec3(aX, aY, aZ : Single) : TVec3;
 function VecAdd(const A, B : TVec3) : TVec3;
 function VecSub(const A, B : TVec3) : TVec3;
 function VecLength(const A : TVec3) : Single;
+function VecNormalize(const A : TVec3) : TVec3;
+function VecScale(const A : TVec3; aFactor : Single) : TVec3;
 
 /// <summary>
 /// Calculates the axis and angle of the rotation that turns the +Y axis to aDir.
@@ -172,6 +192,23 @@ end;
 function VecLength(const A : TVec3) : Single;
 begin
   Result := Sqrt((A.X * A.X) + (A.Y * A.Y) + (A.Z * A.Z));
+end;
+
+function VecNormalize(const A : TVec3) : TVec3;
+var
+  TempLen : Single;
+begin
+  TempLen := VecLength(A);
+
+  if (TempLen < 0.000001) then
+    Result := Vec3(0, 0, 0)
+   else
+    Result := Vec3(A.X / TempLen, A.Y / TempLen, A.Z / TempLen);
+end;
+
+function VecScale(const A : TVec3; aFactor : Single) : TVec3;
+begin
+  Result := Vec3(A.X * aFactor, A.Y * aFactor, A.Z * aFactor);
 end;
 
 function Clamp01Signed(aValue : Single) : Single;
@@ -307,6 +344,9 @@ begin
     begin
       FFilterX[i] := TOneEuroFilter.Create;
       FFilterY[i] := TOneEuroFilter.Create;
+      FFilterWX[i] := TOneEuroFilter.Create;
+      FFilterWY[i] := TOneEuroFilter.Create;
+      FFilterWZ[i] := TOneEuroFilter.Create;
     end;
 
   Mirror    := False;
@@ -324,6 +364,9 @@ begin
     begin
       FFilterX[i].Free;
       FFilterY[i].Free;
+      FFilterWX[i].Free;
+      FFilterWY[i].Free;
+      FFilterWZ[i].Free;
     end;
 
   inherited Destroy;
@@ -337,6 +380,10 @@ begin
     begin
       FFilterX[i].Reset;
       FFilterY[i].Reset;
+      FFilterWX[i].Reset;
+      FFilterWY[i].Reset;
+      FFilterWZ[i].Reset;
+      FW[i]    := Vec3(0, 0, 0);
       FSeen[i] := False;
       FX[i]    := 0;
       FY[i]    := 0;
@@ -586,6 +633,203 @@ begin
   Result.HeadYaw := TempHeadYaw;
   Result.Valid   := True;
   FLastPose      := Result;
+end;
+
+// Unit direction from the measured 3D keypoint aFrom to aTo.
+function TPoseSolver.Dir3D(aFrom, aTo : integer) : TVec3;
+begin
+  Result := VecNormalize(VecSub(FW[aTo], FW[aFrom]));
+end;
+
+// Child joint at the distance aLen of aParent, in the measured direction.
+function TPoseSolver.Limb3D(const aParent : TVec3; aFrom, aTo : integer; aLen : Single) : TVec3;
+var
+  TempDir : TVec3;
+begin
+  if not(FSeen[aTo]) then
+    begin
+      Result := Vec3(aParent.X, aParent.Y - aLen, aParent.Z);
+      exit;
+    end;
+
+  TempDir := Dir3D(aFrom, aTo);
+  Result  := VecAdd(aParent, VecScale(TempDir, aLen));
+end;
+
+function TPoseSolver.Solve3D(const aRaw : TKeypoints; const aWorld : TKeypoints3D; aFrameW, aFrameH, aTime : Single) : TAvatarPose;
+var
+  i : integer;
+  TempKp : TKeypoints;
+  TempW : TKeypoints3D;
+  TempSwapKp : TKeypoint;
+  TempSwapW : TVec3;
+  TempShMidX, TempShMidY, TempHipMidX, TempHipMidY : Single;
+  TempShMidW, TempHipMidW, TempPelvis, TempChest, TempSpine : TVec3;
+  TempTorsoPx, TempTorsoW, TempTarget : Single;
+  TempVs, TempVh : TVec3;
+  TempYawS, TempYawH, TempYaw : Single;
+  TempHeadDir, TempEarMid, TempFace : TVec3;
+  TempOff : TVec3;
+
+  function Joint(aKp : integer; const aCenter, aMid : TVec3; aWidth : Single; aOther : integer) : TVec3;
+  var
+    TempAcross, TempScaled : TVec3;
+    TempWidth : Single;
+  begin
+    // Position of the joint relative to the middle of the body, scaled to the
+    // width of the body model.
+    TempAcross := VecSub(FW[aKp], FW[aOther]);
+    TempWidth  := VecLength(TempAcross);
+
+    if (TempWidth < 0.01) then
+      TempScaled := Vec3(0, 0, 0)
+     else
+      TempScaled := VecScale(VecSub(FW[aKp], aMid), aWidth / TempWidth);
+
+    Result := VecAdd(aCenter, TempScaled);
+  end;
+
+begin
+  Result       := FLastPose;
+  Result.Valid := False;
+
+  TempKp := aRaw;
+  TempW  := aWorld;
+
+  for i := 0 to pred(KEYPOINT_COUNT) do
+    TempW[i].Z := TempW[i].Z * DepthSign;
+
+  // Mirror : flip x and swap the left and right keypoints.
+  if Mirror then
+    begin
+      for i := 0 to pred(KEYPOINT_COUNT) do
+        begin
+          TempKp[i].X := aFrameW - TempKp[i].X;
+          TempW[i].X  := -TempW[i].X;
+        end;
+
+      i := 1;
+      while (i < KEYPOINT_COUNT) do
+        begin
+          TempSwapKp    := TempKp[i];
+          TempKp[i]     := TempKp[i + 1];
+          TempKp[i + 1] := TempSwapKp;
+          TempSwapW     := TempW[i];
+          TempW[i]      := TempW[i + 1];
+          TempW[i + 1]  := TempSwapW;
+          inc(i, 2);
+        end;
+    end;
+
+  for i := 0 to pred(KEYPOINT_COUNT) do
+    if (TempKp[i].Score >= MinScore) then
+      begin
+        FX[i]    := FFilterX[i].Filter(TempKp[i].X, aTime);
+        FY[i]    := FFilterY[i].Filter(TempKp[i].Y, aTime);
+        FW[i].X  := FFilterWX[i].Filter(TempW[i].X, aTime);
+        FW[i].Y  := FFilterWY[i].Filter(TempW[i].Y, aTime);
+        FW[i].Z  := FFilterWZ[i].Filter(TempW[i].Z, aTime);
+        FSeen[i] := True;
+      end;
+
+  if not(FSeen[KP_L_SHOULDER] and FSeen[KP_R_SHOULDER] and
+         FSeen[KP_L_HIP]      and FSeen[KP_R_HIP]) then
+    exit;
+
+  TempShMidX  := (FX[KP_L_SHOULDER] + FX[KP_R_SHOULDER]) / 2;
+  TempShMidY  := (FY[KP_L_SHOULDER] + FY[KP_R_SHOULDER]) / 2;
+  TempHipMidX := (FX[KP_L_HIP] + FX[KP_R_HIP]) / 2;
+  TempHipMidY := (FY[KP_L_HIP] + FY[KP_R_HIP]) / 2;
+  TempShMidW  := VecScale(VecAdd(FW[KP_L_SHOULDER], FW[KP_R_SHOULDER]), 0.5);
+  TempHipMidW := VecScale(VecAdd(FW[KP_L_HIP], FW[KP_R_HIP]), 0.5);
+
+  // Meters per pixel : the measured torso length in meters / in pixels. Only
+  // used to move the avatar in the frame.
+  TempTorsoPx := Sqrt(Sqr(TempShMidX - TempHipMidX) + Sqr(TempShMidY - TempHipMidY));
+  TempTorsoW  := VecLength(VecSub(TempShMidW, TempHipMidW));
+
+  if (TempTorsoPx < 1) or (TempTorsoW < 0.05) then exit;
+
+  TempTarget := TempTorsoW / TempTorsoPx;
+
+  if not(FHasScale) then
+    begin
+      FScale    := TempTarget;
+      FHasScale := True;
+    end
+   else
+    FScale := FScale + (0.05 * (TempTarget - FScale));
+
+  if not(FHasRef) then
+    begin
+      FRefX   := TempHipMidX;
+      FRefY   := TempHipMidY;
+      FHasRef := True;
+    end;
+
+  TempPelvis := Vec3((TempHipMidX - FRefX) * FScale,
+                     PELVIS_HEIGHT - ((TempHipMidY - FRefY) * FScale),
+                     0);
+
+  // Spine : the measured direction, including the lean to the camera.
+  TempSpine := VecNormalize(VecSub(TempShMidW, TempHipMidW));
+  TempChest := VecAdd(TempPelvis, VecScale(TempSpine, TORSO_LEN));
+
+  // Turn of the body : the direction of the shoulder line (and the hip line)
+  // in the horizontal plane. The left shoulder is at +X when facing the camera.
+  TempVs   := VecSub(FW[KP_L_SHOULDER], FW[KP_R_SHOULDER]);
+  TempVh   := VecSub(FW[KP_L_HIP], FW[KP_R_HIP]);
+  TempYawS := ArcTan2(-TempVs.Z, TempVs.X);
+  TempYawH := ArcTan2(-TempVh.Z, TempVh.X);
+  TempYaw  := (0.7 * TempYawS) + (0.3 * TempYawH);
+
+  Result.TorsoYaw        := TempYaw;
+  Result.Joints[jPelvis] := TempPelvis;
+  Result.Joints[jChest]  := TempChest;
+
+  Result.Joints[jLShoulder] := Joint(KP_L_SHOULDER, TempChest, TempShMidW, SHOULDER_WIDTH / 2, KP_R_SHOULDER);
+  Result.Joints[jRShoulder] := Joint(KP_R_SHOULDER, TempChest, TempShMidW, SHOULDER_WIDTH / 2, KP_L_SHOULDER);
+  Result.Joints[jLHip]      := Joint(KP_L_HIP, TempPelvis, TempHipMidW, HIP_WIDTH / 2, KP_R_HIP);
+  Result.Joints[jRHip]      := Joint(KP_R_HIP, TempPelvis, TempHipMidW, HIP_WIDTH / 2, KP_L_HIP);
+
+  Result.Joints[jLElbow] := Limb3D(Result.Joints[jLShoulder], KP_L_SHOULDER, KP_L_ELBOW, UPPER_ARM_LEN);
+  Result.Joints[jRElbow] := Limb3D(Result.Joints[jRShoulder], KP_R_SHOULDER, KP_R_ELBOW, UPPER_ARM_LEN);
+  Result.Joints[jLWrist] := Limb3D(Result.Joints[jLElbow], KP_L_ELBOW, KP_L_WRIST, FOREARM_LEN);
+  Result.Joints[jRWrist] := Limb3D(Result.Joints[jRElbow], KP_R_ELBOW, KP_R_WRIST, FOREARM_LEN);
+  Result.Joints[jLKnee]  := Limb3D(Result.Joints[jLHip], KP_L_HIP, KP_L_KNEE, THIGH_LEN);
+  Result.Joints[jRKnee]  := Limb3D(Result.Joints[jRHip], KP_R_HIP, KP_R_KNEE, THIGH_LEN);
+  Result.Joints[jLAnkle] := Limb3D(Result.Joints[jLKnee], KP_L_KNEE, KP_L_ANKLE, SHIN_LEN);
+  Result.Joints[jRAnkle] := Limb3D(Result.Joints[jRKnee], KP_R_KNEE, KP_R_ANKLE, SHIN_LEN);
+
+  // Head : above the shoulders, towards the ears. The face looks to the nose.
+  if FSeen[KP_L_EAR] and FSeen[KP_R_EAR] then
+    TempEarMid := VecScale(VecAdd(FW[KP_L_EAR], FW[KP_R_EAR]), 0.5)
+   else
+    if FSeen[KP_NOSE] then
+      TempEarMid := FW[KP_NOSE]
+     else
+      TempEarMid := VecAdd(TempShMidW, Vec3(0, HEAD_DISTANCE, 0));
+
+  TempHeadDir := VecNormalize(VecSub(TempEarMid, TempShMidW));
+  if (TempHeadDir.Y < 0.3) then TempHeadDir := Vec3(TempHeadDir.X, 0.3, TempHeadDir.Z);
+  TempHeadDir := VecNormalize(TempHeadDir);
+
+  Result.Joints[jHead] := VecAdd(TempChest, VecScale(TempHeadDir, HEAD_DISTANCE));
+  Result.HeadRoll      := ArcTan2(-TempHeadDir.X, TempHeadDir.Y);
+  Result.HeadYaw       := TempYaw;
+
+  if FSeen[KP_NOSE] and FSeen[KP_L_EAR] and FSeen[KP_R_EAR] then
+    begin
+      TempFace := VecSub(FW[KP_NOSE], TempEarMid);
+
+      // The face looks to +Z when it faces the camera.
+      if (Abs(TempFace.X) + Abs(TempFace.Z) > 0.01) then
+        Result.HeadYaw := ArcTan2(TempFace.X, TempFace.Z);
+    end;
+
+  TempOff := Result.Joints[jPelvis];
+  Result.Valid := True;
+  FLastPose    := Result;
 end;
 
 end.

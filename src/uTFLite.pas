@@ -48,14 +48,20 @@ type
       /// <summary>
       /// Copies RGB bytes (aWidth x aHeight x 3) to the input tensor. The size
       /// must be the size of the model input. float32 models get the values
-      /// 0..255, uint8 models the bytes and int32 models the integers.
+      /// 0..255 multiplied by aFloatScale (1/255 for BlazePose), uint8 models
+      /// the bytes and int32 models the integers.
       /// </summary>
-      procedure SetInputRGB(aRGB : PByte; aWidth, aHeight : integer);
+      procedure SetInputRGB(aRGB : PByte; aWidth, aHeight : integer; aFloatScale : Single = 1);
       procedure Invoke;
       /// <summary>
       /// Reads the float32 output tensor aIndex.
       /// </summary>
       procedure ReadOutput(aIndex : integer; out aData : TArray<Single>);
+      /// <summary>
+      /// Number of output tensors and number of values of an output tensor.
+      /// </summary>
+      function  OutputCount : integer;
+      function  OutputValueCount(aIndex : integer) : integer;
 
       property InputType : integer read FInputType;
       function InputDim(aIndex : integer) : integer;
@@ -75,6 +81,7 @@ type
   TAllocateTensors       = function(aInterpreter : Pointer) : Int32; cdecl;
   TGetInputTensor        = function(aInterpreter : Pointer; aIndex : Int32) : Pointer; cdecl;
   TGetOutputTensor       = function(aInterpreter : Pointer; aIndex : Int32) : Pointer; cdecl;
+  TGetOutputCount        = function(aInterpreter : Pointer) : Int32; cdecl;
   TInvoke                = function(aInterpreter : Pointer) : Int32; cdecl;
   TTensorType            = function(aTensor : Pointer) : Int32; cdecl;
   TTensorNumDims         = function(aTensor : Pointer) : Int32; cdecl;
@@ -95,6 +102,7 @@ var
   AllocateTensors      : TAllocateTensors;
   GetInputTensor       : TGetInputTensor;
   GetOutputTensor      : TGetOutputTensor;
+  GetOutputCount       : TGetOutputCount;
   InvokeInterpreter    : TInvoke;
   TensorType           : TTensorType;
   TensorNumDims        : TTensorNumDims;
@@ -138,6 +146,7 @@ begin
   @AllocateTensors      := GetProc('TfLiteInterpreterAllocateTensors');
   @GetInputTensor       := GetProc('TfLiteInterpreterGetInputTensor');
   @GetOutputTensor      := GetProc('TfLiteInterpreterGetOutputTensor');
+  @GetOutputCount       := GetProc('TfLiteInterpreterGetOutputTensorCount');
   @InvokeInterpreter    := GetProc('TfLiteInterpreterInvoke');
   @TensorType           := GetProc('TfLiteTensorType');
   @TensorNumDims        := GetProc('TfLiteTensorNumDims');
@@ -214,7 +223,7 @@ begin
   Result := length(FInputDims);
 end;
 
-procedure TTFLiteInterpreter.SetInputRGB(aRGB : PByte; aWidth, aHeight : integer);
+procedure TTFLiteInterpreter.SetInputRGB(aRGB : PByte; aWidth, aHeight : integer; aFloatScale : Single);
 var
   TempTensor : Pointer;
   TempCount, i : integer;
@@ -229,7 +238,7 @@ begin
       begin
         SetLength(TempFloats, TempCount);
         for i := 0 to pred(TempCount) do
-          TempFloats[i] := PByte(NativeUInt(aRGB) + NativeUInt(i))^;
+          TempFloats[i] := PByte(NativeUInt(aRGB) + NativeUInt(i))^ * aFloatScale;
 
         CheckStatus(TensorCopyFromBuffer(TempTensor, @TempFloats[0], TempCount * SizeOf(Single)), 'CopyFromBuffer');
       end;
@@ -254,6 +263,23 @@ end;
 procedure TTFLiteInterpreter.Invoke;
 begin
   CheckStatus(InvokeInterpreter(FInterpreter), 'Invoke');
+end;
+
+function TTFLiteInterpreter.OutputCount : integer;
+begin
+  Result := GetOutputCount(FInterpreter);
+end;
+
+function TTFLiteInterpreter.OutputValueCount(aIndex : integer) : integer;
+var
+  TempTensor : Pointer;
+begin
+  TempTensor := GetOutputTensor(FInterpreter, aIndex);
+
+  if (TempTensor = nil) then
+    Result := 0
+   else
+    Result := TensorByteSize(TempTensor) div SizeOf(Single);
 end;
 
 procedure TTFLiteInterpreter.ReadOutput(aIndex : integer; out aData : TArray<Single>);

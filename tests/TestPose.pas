@@ -8,7 +8,7 @@ program TestPose;
 {$APPTYPE CONSOLE}
 
 uses
-  SysUtils, Math, uPoseSolver, uPoseImage;
+  SysUtils, Math, uPoseSolver, uPoseImage, uPoseRig, uRigFixtures, uPoseEstimator, uBlazeDecode;
 
 var
   Failures : integer = 0;
@@ -92,6 +92,51 @@ begin
   end;
 end;
 
+// 3D positions (meters) of the standing person : aArms 0 = hanging,
+// 2 = the left arm points to the camera. aYaw turns the whole body.
+function StandingWorld(aArms : integer; aYaw : Single) : TKeypoints3D;
+var
+  TempHip, TempSh, TempSide : Single;
+
+  procedure W(aIdx : integer; aX, aY, aZ : Single);
+  begin
+    // turn around the vertical axis : x' = x cos + z sin, z' = -x sin + z cos
+    Result[aIdx] := Vec3((aX * Cos(aYaw)) + (aZ * Sin(aYaw)), aY, (-aX * Sin(aYaw)) + (aZ * Cos(aYaw)));
+  end;
+
+begin
+  FillChar(Result, SizeOf(Result), 0);
+
+  TempHip  := PELVIS_HEIGHT;
+  TempSh   := PELVIS_HEIGHT + TORSO_LEN;
+  TempSide := SHOULDER_WIDTH / 2;
+
+  W(KP_L_SHOULDER,  TempSide, TempSh, 0);
+  W(KP_R_SHOULDER, -TempSide, TempSh, 0);
+  W(KP_L_HIP,       HIP_WIDTH / 2, TempHip, 0);
+  W(KP_R_HIP,      -HIP_WIDTH / 2, TempHip, 0);
+  W(KP_L_KNEE,      HIP_WIDTH / 2, TempHip - THIGH_LEN, 0);
+  W(KP_R_KNEE,     -HIP_WIDTH / 2, TempHip - THIGH_LEN, 0);
+  W(KP_L_ANKLE,     HIP_WIDTH / 2, FOOT_HEIGHT, 0);
+  W(KP_R_ANKLE,    -HIP_WIDTH / 2, FOOT_HEIGHT, 0);
+  W(KP_L_EAR,       0.08, TempSh + HEAD_DISTANCE, 0);
+  W(KP_R_EAR,      -0.08, TempSh + HEAD_DISTANCE, 0);
+  W(KP_NOSE,        0, TempSh + HEAD_DISTANCE - 0.03, 0.10);
+  W(KP_R_ELBOW,    -TempSide, TempSh - UPPER_ARM_LEN, 0);
+  W(KP_R_WRIST,    -TempSide, TempSh - UPPER_ARM_LEN - FOREARM_LEN, 0);
+
+  if (aArms = 2) then
+    begin
+      W(KP_L_ELBOW, TempSide, TempSh, UPPER_ARM_LEN);
+      W(KP_L_WRIST, TempSide, TempSh, UPPER_ARM_LEN + FOREARM_LEN);
+    end
+   else
+    begin
+      W(KP_L_ELBOW, TempSide, TempSh - UPPER_ARM_LEN, 0);
+      W(KP_L_WRIST, TempSide, TempSh - UPPER_ARM_LEN - FOREARM_LEN, 0);
+    end;
+end;
+
 // Feeds the same keypoints for some frames, so the filters settle
 function SolveFrames(aSolver : TPoseSolver; const aKp : TKeypoints; aFrames : integer) : TAvatarPose;
 var
@@ -101,9 +146,94 @@ begin
     Result := aSolver.Solve(aKp, FRAME_W, FRAME_H, i / 30);
 end;
 
+function SolveFrames3D(aSolver : TPoseSolver; const aKp : TKeypoints; const aWorld : TKeypoints3D; aFrames : integer) : TAvatarPose;
+var
+  i : integer;
+begin
+  for i := 0 to pred(aFrames) do
+    Result := aSolver.Solve3D(aKp, aWorld, FRAME_W, FRAME_H, i / 30);
+end;
+
 function Dist(const a, b : TVec3) : Single;
 begin
   Result := VecLength(VecSub(a, b));
+end;
+
+// Checks the retargeting for a profile : every arm and leg bone has to point
+// to the next joint of the pose, whatever the rest orientation of the bone is.
+procedure CheckRig(const aName : string; const aProfile : TRigProfile; const aRest : TRigRestArray;
+                   const aPose : TAvatarPose; aTol : Single);
+var
+  TempRig : TRigPose;
+  TempNewW : array of TQuat;
+  i, TempParent : integer;
+  TempDir, TempWant : TVec3;
+  TempWorst, TempErr : Single;
+begin
+  BuildRigPose(aProfile, aRest, aPose, TempRig);
+  SetLength(TempNewW, length(aProfile.Bones));
+  TempWorst := 0;
+
+  for i := 0 to high(aProfile.Bones) do
+    begin
+      TempParent := aProfile.Bones[i].Parent;
+
+      if (TempParent >= 0) then
+        TempNewW[i] := QuatMul(TempNewW[TempParent], TempRig.Rotation[i])
+       else
+        TempNewW[i] := TempRig.Rotation[i];
+
+      if (aProfile.Bones[i].Role = rrLimb) then
+        begin
+          TempDir  := VecNormalize(QuatRotate(TempNewW[i], aRest[aProfile.Bones[i].Child].Translation));
+          TempWant := VecNormalize(VecSub(aPose.Joints[aProfile.Bones[i].ToJoint], aPose.Joints[aProfile.Bones[i].FromJoint]));
+          TempErr  := Dist(TempDir, TempWant);
+          if (TempErr > TempWorst) then TempWorst := TempErr;
+        end;
+    end;
+
+  Check('rig ' + aProfile.Name + ' ' + aName, TempWorst <= aTol, 'worst error ' + FloatToStr(TempWorst));
+end;
+
+// The parents of the profile have to be the parents in the glb file
+procedure CheckProfile(const aProfile : TRigProfile; const aParents : TStringArray);
+var
+  i, j : integer;
+  TempOk, TempInList : boolean;
+begin
+  TempOk := (length(aParents) = length(aProfile.Bones));
+
+  for i := 0 to high(aProfile.Bones) do
+    if TempOk then
+      if (aProfile.Bones[i].Parent >= 0) then
+        begin
+          if (aProfile.Bones[i].Parent >= i) or (aProfile.Bones[aProfile.Bones[i].Parent].Node <> aParents[i]) then
+            begin
+              TempOk := False;
+              writeln('  parent of ', aProfile.Bones[i].Node, ' is ', aParents[i]);
+            end;
+        end
+       else
+        begin
+          // The parent is not a bone of the profile
+          TempInList := False;
+          for j := 0 to high(aProfile.Bones) do
+            if (aProfile.Bones[j].Node = aParents[i]) then TempInList := True;
+
+          if TempInList then
+            begin
+              TempOk := False;
+              writeln('  parent of ', aProfile.Bones[i].Node, ' is a bone : ', aParents[i]);
+            end;
+        end;
+
+  Check('profile ' + aProfile.Name + ' hierarchy', TempOk);
+end;
+
+procedure CheckRigAll(const aName : string; const aPose : TAvatarPose; aTol : Single);
+begin
+  CheckRig(aName, GhwmaqProfile, GhwmaqRest, aPose, aTol);
+  CheckRig(aName, GhwBodyProfile, GhwBodyRest, aPose, aTol);
 end;
 
 var
@@ -118,6 +248,11 @@ var
   TempCx, TempCy, TempCs : integer;
   TempFilter : TOneEuroFilter;
   TempOut : Single;
+  TempRig : TRigPose;
+  TempLm : array[0..194] of Single;
+  TempWorld : array[0..116] of Single;
+  TempRoi, TempRoi2 : TBlazeRoi;
+  TempRes : TPoseResult;
 begin
   // ---- Vector helpers ----
   for i := 0 to 5 do
@@ -286,6 +421,119 @@ begin
     TempFilter.Free;
   end;
 
+  CheckProfile(GhwmaqProfile, GhwmaqParents);
+  CheckProfile(GhwBodyProfile, GhwBodyParents);
+
+  // ---- Rig : the bones of both models point to the joints of the pose ----
+  TempSolver := TPoseSolver.Create;
+  try
+    CheckRigAll('standing', SolveFrames(TempSolver, Standing(0.0018, 0, 0), 5), 0.001);
+    TempSolver.Reset;
+    CheckRigAll('T-pose', SolveFrames(TempSolver, Standing(0.0018, 1, 0), 5), 0.001);
+    TempSolver.Reset;
+    CheckRigAll('arm to the camera', SolveFrames(TempSolver, Standing(0.0018, 2, 0), 5), 0.001);
+  finally
+    TempSolver.Free;
+  end;
+  TempSolver := TPoseSolver.Create;
+  try
+    TempKp := Standing(0.0018, 0, 0);
+    for i in [KP_L_SHOULDER, KP_L_HIP, KP_L_ELBOW, KP_L_WRIST, KP_L_KNEE, KP_L_ANKLE,
+              KP_R_SHOULDER, KP_R_HIP, KP_R_ELBOW, KP_R_WRIST, KP_R_KNEE, KP_R_ANKLE] do
+      TempKp[i].X := (FRAME_W / 2) + ((TempKp[i].X - (FRAME_W / 2)) * 0.5);
+    TempKp[KP_NOSE].X := (FRAME_W / 2) + 60;
+    CheckRigAll('turned body', SolveFrames(TempSolver, TempKp, 5), 0.001);
+  finally
+    TempSolver.Free;
+  end;
+
+  // The rig of a standing pose changes little : the legs stay down
+  TempSolver := TPoseSolver.Create;
+  try
+    BuildRigPose(GhwmaqProfile, GhwmaqRest, SolveFrames(TempSolver, Standing(0.0018, 0, 0), 5), TempRig);
+    Check('rig root offset (standing)', Near(TempRig.RootOffset.Y, 0, 0.01) and Near(TempRig.RootOffset.X, 0, 0.01));
+    Check('rig has a rotation for each bone', length(TempRig.Rotation) = length(GhwmaqProfile.Bones));
+  finally
+    TempSolver.Free;
+  end;
+
+  // ---- Quaternions ----
+  TempV := QuatRotate(QuatAlign(Vec3(0, -1, 0), Vec3(1, 0, 0)), Vec3(0, -1, 0));
+  Check('QuatAlign', Near(TempV.X, 1, 0.001) and Near(TempV.Y, 0, 0.001));
+  TempV := QuatRotate(QuatAlign(Vec3(0, -1, 0), Vec3(0, 1, 0)), Vec3(0, -1, 0));
+  Check('QuatAlign opposite', Near(TempV.Y, 1, 0.001));
+  QuatToAxisAngle(QuatFromAxisAngle(Vec3(0, 1, 0), 0.7), TempAxis, TempAngle);
+  Check('QuatToAxisAngle', Near(TempAxis.Y, 1, 0.001) and Near(TempAngle, 0.7, 0.001));
+
+  // ---- Solve3D : the depth and the turn are measured ----
+  TempSolver := TPoseSolver.Create;
+  try
+    TempPose := SolveFrames3D(TempSolver, Standing(0.0018, 0, 0), StandingWorld(0, 0), 5);
+    Check('3D valid', TempPose.Valid);
+    Check('3D no yaw', Near(TempPose.TorsoYaw, 0, 0.02));
+    Check('3D upper arm length', Near(Dist(TempPose.Joints[jLShoulder], TempPose.Joints[jLElbow]), UPPER_ARM_LEN, 0.01));
+    Check('3D arm hangs', Near(TempPose.Joints[jLWrist].Y, TempPose.Joints[jLShoulder].Y - UPPER_ARM_LEN - FOREARM_LEN, 0.02));
+    Check('3D chest', Near(TempPose.Joints[jChest].Y, PELVIS_HEIGHT + TORSO_LEN, 0.02));
+    Check('3D head yaw (facing the camera)', Near(TempPose.HeadYaw, 0, 0.05));
+    CheckRigAll('3D standing', TempPose, 0.001);
+    TempSolver.Reset;
+    TempPose := SolveFrames3D(TempSolver, Standing(0.0018, 2, 0), StandingWorld(2, 0), 5);
+    Check('3D arm to the camera (measured)', Near(TempPose.Joints[jLElbow].Z - TempPose.Joints[jLShoulder].Z, UPPER_ARM_LEN, 0.02));
+    Check('3D arm to the camera, wrist', Near(TempPose.Joints[jLWrist].Z - TempPose.Joints[jLElbow].Z, FOREARM_LEN, 0.02));
+    CheckRigAll('3D arm to the camera', TempPose, 0.001);
+    TempSolver.DepthSign := -1;
+    TempPose := SolveFrames3D(TempSolver, Standing(0.0018, 2, 0), StandingWorld(2, 0), 8);
+    Check('3D DepthSign', TempPose.Joints[jLElbow].Z < TempPose.Joints[jLShoulder].Z);
+  finally
+    TempSolver.Free;
+  end;
+  // The body turned 70 degrees. The nose looks to the same side.
+  TempSolver := TPoseSolver.Create;
+  try
+    TempPose := SolveFrames3D(TempSolver, Standing(0.0018, 0, 0), StandingWorld(0, DegToRad(70)), 5);
+    Check('3D yaw 70 degrees', Near(TempPose.TorsoYaw, DegToRad(70), 0.05), FloatToStr(RadToDeg(TempPose.TorsoYaw)));
+    Check('3D head yaw 70 degrees', Near(TempPose.HeadYaw, DegToRad(70), 0.1), FloatToStr(RadToDeg(TempPose.HeadYaw)));
+    Check('3D right shoulder is nearer', TempPose.Joints[jRShoulder].Z > TempPose.Joints[jLShoulder].Z);
+  finally
+    TempSolver.Free;
+  end;
+  // Mirror : the same pose seen as a reflection
+  TempSolver := TPoseSolver.Create;
+  try
+    TempSolver.Mirror := True;
+    TempPose := SolveFrames3D(TempSolver, Standing(0.0018, 0, 0), StandingWorld(2, 0), 5);
+    Check('3D mirror keeps the left side at +X', TempPose.Joints[jLShoulder].X > 0);
+    // The person's left arm (to the camera) is the avatar's right arm now
+    Check('3D mirror swaps the arms', TempPose.Joints[jRElbow].Z - TempPose.Joints[jRShoulder].Z > 0.2);
+  finally
+    TempSolver.Free;
+  end;
+
+  // ---- BlazePose output decoding ----
+  FillChar(TempLm, SizeOf(TempLm), 0);
+  FillChar(TempWorld, SizeOf(TempWorld), 0);
+  BlazeFullFrameRoi(1280, 720, TempRoi);
+  Check('full frame roi', Near(TempRoi.CX, 640, 0.01) and Near(TempRoi.Side, 720, 0.01));
+  // left shoulder (landmark 11) at (128, 64) of the 256 input, visible
+  TempLm[(11 * 5) + 0] := 128; TempLm[(11 * 5) + 1] := 64; TempLm[(11 * 5) + 3] := 8;
+  // hip center (33) and the scale point (34) : radius 100 input pixels
+  TempLm[(33 * 5) + 0] := 128; TempLm[(33 * 5) + 1] := 128;
+  TempLm[(34 * 5) + 0] := 128; TempLm[(34 * 5) + 1] := 228;
+  // world : left shoulder 0.2 m right, 0.5 m up (y is down), 0.1 m nearer to the camera (z smaller)
+  TempWorld[(11 * 3) + 0] := 0.2; TempWorld[(11 * 3) + 1] := -0.5; TempWorld[(11 * 3) + 2] := -0.1;
+  BlazeDecode(TempLm, TempWorld, 256, TempRoi, 1280, 720, TempRes, TempRoi2);
+  Check('blaze found', TempRes.Found and TempRes.Has3D);
+  // roi : left = 640 - 360 = 280, factor 720/256 = 2.8125
+  Check('blaze keypoint x', Near(TempRes.Keypoints[KP_L_SHOULDER].X, 280 + (128 * 2.8125), 0.01));
+  Check('blaze keypoint y', Near(TempRes.Keypoints[KP_L_SHOULDER].Y, 64 * 2.8125, 0.01));
+  Check('blaze visibility', TempRes.Keypoints[KP_L_SHOULDER].Score > 0.99);
+  Check('blaze world axes', Near(TempRes.World[KP_L_SHOULDER].X, 0.2, 0.001) and
+        Near(TempRes.World[KP_L_SHOULDER].Y, 0.5, 0.001) and Near(TempRes.World[KP_L_SHOULDER].Z, 0.1, 0.001));
+  Check('blaze next roi', Near(TempRoi2.CX, 640, 0.01) and Near(TempRoi2.CY, 360, 0.01) and
+        Near(TempRoi2.Side, 100 * 2.8125 * 2 * 1.25, 0.1));
+  BlazeDecode(TempLm, TempWorld[0..10], 256, TempRoi, 1280, 720, TempRes, TempRoi2);
+  Check('blaze without world', TempRes.Found and not(TempRes.Has3D));
+
   // ---- Image crop and resize ----
   // 8x6 BGRA image, left half blue-ish, right half red-ish. The crop is 6x6 at x=1.
   for j := 0 to 5 do
@@ -301,6 +549,12 @@ begin
   Check('BGRA to RGB', (TempDst[0] = 30) and (TempDst[1] = 20) and (TempDst[2] = 10));
   CropResizeToRGB(@TempSrc[0], 8, 6, 8 * 4, False, @TempDst[0], 4, TempCx, TempCy, TempCs);
   Check('RGBA to RGB', (TempDst[0] = 10) and (TempDst[1] = 20) and (TempDst[2] = 30));
+
+  // Region crop : the part outside of the frame is black
+  FillChar(TempSrc, SizeOf(TempSrc), 200);
+  CropRegionToRGB(@TempSrc[0], 8, 6, 8 * 4, True, 0, 0, 8, @TempDst[0], 4);
+  Check('region outside is black', (TempDst[0] = 0) and (TempDst[1] = 0));
+  Check('region inside has the color', TempDst[((3 * 4) + 3) * 3] > 100);
 
   writeln;
   writeln(Total, ' checks, ', Failures, ' failures');

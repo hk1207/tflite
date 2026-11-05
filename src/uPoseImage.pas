@@ -8,6 +8,9 @@ unit uPoseImage;
 
 interface
 
+uses
+  {$IFDEF FPC}Math{$ELSE}System.Math{$ENDIF};
+
 type
   PPixelBytes = ^TPixelBytes;
   TPixelBytes = array[0..134217727] of Byte;
@@ -22,6 +25,15 @@ type
 procedure CropResizeToRGB(aSrc : Pointer; aW, aH, aPitch : integer; aBGRA : boolean;
                           aDst : Pointer; aDstSize : integer;
                           out aCropX, aCropY, aCropSize : integer);
+
+/// <summary>
+/// Same as CropResizeToRGB for any square of the frame : the center is (aCenterX,
+/// aCenterY) and the side aSide, in pixels of the frame. The part of the square
+/// that is outside of the frame is black.
+/// </summary>
+procedure CropRegionToRGB(aSrc : Pointer; aW, aH, aPitch : integer; aBGRA : boolean;
+                          aCenterX, aCenterY, aSide : Single;
+                          aDst : Pointer; aDstSize : integer);
 
 implementation
 
@@ -84,6 +96,68 @@ begin
                            (TempP10 * TempFx * (1 - TempFy)) +
                            (TempP01 * (1 - TempFx) * TempFy) +
                            (TempP11 * TempFx * TempFy);
+
+              TempDst^[(((y * aDstSize) + x) * 3) + c] := Byte(round(TempValue));
+            end;
+        end;
+    end;
+end;
+
+
+procedure CropRegionToRGB(aSrc : Pointer; aW, aH, aPitch : integer; aBGRA : boolean;
+                          aCenterX, aCenterY, aSide : Single;
+                          aDst : Pointer; aDstSize : integer);
+var
+  TempSrc, TempDst : PPixelBytes;
+  x, y, x0, y0, x1, y1, c : integer;
+  TempLeft, TempTop, TempRatio, TempSx, TempSy, TempFx, TempFy, TempValue : Single;
+  TempIdx : array[0..2] of integer;
+
+  function Pixel(aX, aY, aC : integer) : Single;
+  begin
+    if (aX < 0) or (aY < 0) or (aX >= aW) or (aY >= aH) then
+      Result := 0
+     else
+      Result := TempSrc^[(aY * aPitch) + (aX * 4) + TempIdx[aC]];
+  end;
+
+begin
+  TempSrc := PPixelBytes(aSrc);
+  TempDst := PPixelBytes(aDst);
+
+  if aBGRA then
+    begin
+      TempIdx[0] := 2; TempIdx[1] := 1; TempIdx[2] := 0;
+    end
+   else
+    begin
+      TempIdx[0] := 0; TempIdx[1] := 1; TempIdx[2] := 2;
+    end;
+
+  TempLeft  := aCenterX - (aSide / 2);
+  TempTop   := aCenterY - (aSide / 2);
+  TempRatio := aSide / aDstSize;
+
+  for y := 0 to pred(aDstSize) do
+    begin
+      TempSy := TempTop + (((y + 0.5) * TempRatio) - 0.5);
+      y0     := Floor(TempSy);
+      y1     := y0 + 1;
+      TempFy := TempSy - y0;
+
+      for x := 0 to pred(aDstSize) do
+        begin
+          TempSx := TempLeft + (((x + 0.5) * TempRatio) - 0.5);
+          x0     := Floor(TempSx);
+          x1     := x0 + 1;
+          TempFx := TempSx - x0;
+
+          for c := 0 to 2 do
+            begin
+              TempValue := (Pixel(x0, y0, c) * (1 - TempFx) * (1 - TempFy)) +
+                           (Pixel(x1, y0, c) * TempFx * (1 - TempFy)) +
+                           (Pixel(x0, y1, c) * (1 - TempFx) * TempFy) +
+                           (Pixel(x1, y1, c) * TempFx * TempFy);
 
               TempDst^[(((y * aDstSize) + x) * 3) + c] := Byte(round(TempValue));
             end;
