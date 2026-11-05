@@ -8,7 +8,7 @@ program TestPose;
 {$APPTYPE CONSOLE}
 
 uses
-  SysUtils, Math, uPoseSolver, uPoseImage, uPoseRig, uRigFixtures, uPoseEstimator, uBlazeDecode;
+  SysUtils, Math, uPoseSolver, uPoseImage, uPoseRig, uRigFixtures, uPoseEstimator, uBlazeDecode, uYoloDecode, uMediaPipeProtocol;
 
 var
   Failures : integer = 0;
@@ -253,6 +253,10 @@ var
   TempWorld : array[0..116] of Single;
   TempRoi, TempRoi2 : TBlazeRoi;
   TempRes : TPoseResult;
+  TempFile : TextFile;
+  TempLine : string;
+  TempYolo : array[0..(3 * 56) - 1] of Single;
+  TempYolo2 : array[0..(3 * 56) - 1] of Single;
 begin
   // ---- Vector helpers ----
   for i := 0 to 5 do
@@ -533,6 +537,46 @@ begin
         Near(TempRoi2.Side, 100 * 2.8125 * 2 * 1.25, 0.1));
   BlazeDecode(TempLm, TempWorld[0..10], 256, TempRoi, 1280, 720, TempRes, TempRoi2);
   Check('blaze without world', TempRes.Found and not(TempRes.Has3D));
+
+  // ---- MediaPipe bridge protocol (line made by tools/mediapipe_bridge.py --selftest) ----
+  AssignFile(TempFile, 'mediapipe_line.txt');
+  Reset(TempFile);
+  ReadLn(TempFile, TempLine);
+  CloseFile(TempFile);
+  Check('mediapipe line is valid', ParseMediaPipeLine(TempLine, TempRes));
+  Check('mediapipe found 3D', TempRes.Found and TempRes.Has3D);
+  Check('mediapipe frame size', Near(TempRes.FrameWidth, 640, 0.01) and Near(TempRes.FrameHeight, 480, 0.01));
+  Check('mediapipe nose pixels', Near(TempRes.Keypoints[KP_NOSE].X, 320, 0.1) and Near(TempRes.Keypoints[KP_NOSE].Y, 96, 0.1));
+  Check('mediapipe left shoulder pixels', Near(TempRes.Keypoints[KP_L_SHOULDER].X, 384, 0.1));
+  Check('mediapipe left shoulder score', Near(TempRes.Keypoints[KP_L_SHOULDER].Score, 0.98, 0.001));
+  Check('mediapipe world axes', Near(TempRes.World[KP_L_SHOULDER].X, 0.2, 0.001) and
+        Near(TempRes.World[KP_L_SHOULDER].Y, 0.45, 0.001) and Near(TempRes.World[KP_L_SHOULDER].Z, -0.05, 0.001));
+  Check('mediapipe no pose line', ParseMediaPipeLine('MP1 640 480 0', TempRes) and not(TempRes.Found));
+  Check('mediapipe wrong tag', not(ParseMediaPipeLine('XX 640 480 0', TempRes)));
+  Check('mediapipe short line', not(ParseMediaPipeLine('MP1 640 480 1 0.5 0.5', TempRes)));
+  Check('mediapipe garbage', not(ParseMediaPipeLine('MP1 640 abc 1', TempRes)));
+
+  // ---- YOLO pose decoding ----
+  // 3 candidates, channels first : candidate 1 is the best person.
+  FillChar(TempYolo, SizeOf(TempYolo), 0);
+  for i := 0 to 2 do
+    TempYolo[(4 * 3) + i] := 0.1;
+  TempYolo[(4 * 3) + 1] := 0.9;
+  // left shoulder (keypoint 5) of candidate 1 at (320, 160) of the 640 input, score 0.8
+  TempYolo[((5 + (5 * 3)) * 3) + 1] := 320;
+  TempYolo[((6 + (5 * 3)) * 3) + 1] := 160;
+  TempYolo[((7 + (5 * 3)) * 3) + 1] := 0.8;
+  Check('yolo found', YoloDecode(TempYolo, 3, True, 640, 100, 50, 480, 0.25, TempRes) and TempRes.Found);
+  Check('yolo keypoint x', Near(TempRes.Keypoints[KP_L_SHOULDER].X, 100 + (320 * 0.75), 0.01));
+  Check('yolo keypoint y', Near(TempRes.Keypoints[KP_L_SHOULDER].Y, 50 + (160 * 0.75), 0.01));
+  Check('yolo score', Near(TempRes.Keypoints[KP_L_SHOULDER].Score, 0.8, 0.001));
+  Check('yolo nobody', not(YoloDecode(TempYolo, 3, True, 640, 0, 0, 640, 0.95, TempRes)));
+  // the same values with the anchors first
+  FillChar(TempYolo2, SizeOf(TempYolo2), 0);
+  TempYolo2[(1 * 56) + 4] := 0.9;
+  TempYolo2[(1 * 56) + 5 + (5 * 3)] := 320;
+  Check('yolo anchors first', YoloDecode(TempYolo2, 3, False, 640, 0, 0, 640, 0.25, TempRes) and
+        Near(TempRes.Keypoints[KP_L_SHOULDER].X, 320, 0.01));
 
   // ---- Image crop and resize ----
   // 8x6 BGRA image, left half blue-ish, right half red-ish. The crop is 6x6 at x=1.

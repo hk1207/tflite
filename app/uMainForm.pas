@@ -29,6 +29,7 @@ type
       FViewport     : TCastleViewport;
       FAvatar       : TRiggedAvatar;
       FCamera       : TCameraComponent;
+      FTimer        : TTimer;
       FFrame        : TBitmap;
       FPose         : TPoseEstimator;
       FSolver       : TPoseSolver;
@@ -56,8 +57,11 @@ type
       procedure OptionChanged(Sender : TObject);
       procedure ResetClick(Sender : TObject);
       procedure FormShowEvent(Sender : TObject);
+      procedure BridgeTimer(Sender : TObject);
+      procedure StartSource;
+      procedure HandleResult(const aResult : TPoseResult; aStart : Double);
       procedure CameraFrame(Sender : TObject; const ATime : TMediaTime);
-      procedure DrawKeypoints(const aResult : TPoseResult);
+      procedure DrawKeypoints(const aResult : TPoseResult; aFromCamera : boolean);
     public
       constructor Create(AOwner : TComponent); override;
       destructor  Destroy; override;
@@ -105,10 +109,7 @@ begin
   if (ParamCount >= 1) then
     LoadPoseModel(ParamStr(1))
    else
-    if (FPoseFiles.Count > 0) then
-      LoadPoseModel(FPoseFiles[0])
-     else
-      FMessage := 'No pose model (.tflite) was found. See models/README.md.';
+    LoadPoseModel(FPoseFiles[0]);
 
   FStatus.Text := FMessage;
   OnShow := FormShowEvent;
@@ -193,6 +194,8 @@ begin
   for i := 0 to 4 do
     begin
       AddFiles(TempDir, '*.tflite', FPoseFiles);
+      AddFiles(TempDir, '*.onnx', FPoseFiles);
+      AddFiles(TPath.Combine(TempDir, 'models'), '*.onnx', FPoseFiles);
       AddFiles(TempDir, '*.task', FPoseFiles);
       AddFiles(TPath.Combine(TempDir, 'models'), '*.task', FPoseFiles);
       AddFiles(TPath.Combine(TempDir, 'models'), '*.tflite', FPoseFiles);
@@ -205,6 +208,9 @@ begin
 
   // BlazePose (3D) before MoveNet (2D)
   FPoseFiles.CustomSort(CompareModelNames);
+
+  // The MediaPipe bridge (Python) is always in the list.
+  FPoseFiles.Add(MEDIAPIPE_SOURCE);
 end;
 
 // Extracts the first file of the zip whose name ends with aSuffix to the
@@ -275,9 +281,9 @@ begin
   FStatus := NewLabel(FPanel, 70);
   FStatus.Text := 'Starting...';
 
-  FPoseCombo := NewCombo('Pose model (BlazePose = 3D, MoveNet = 2D)');
+  FPoseCombo := NewCombo('Pose model (BlazePose/MediaPipe = 3D, MoveNet/YOLO = 2D)');
   for i := 0 to pred(FPoseFiles.Count) do
-    FPoseCombo.Items.Add(ExtractFileName(FPoseFiles[i]));
+    FPoseCombo.Items.Add(PoseSourceCaption(FPoseFiles[i]));
   if (FPoseCombo.Items.Count > 0) then FPoseCombo.ItemIndex := 0;
   FPoseCombo.OnChange := PoseChanged;
 
@@ -299,6 +305,12 @@ begin
   FResetButton.OnClick := ResetClick;
 
   FSolver.Mirror := FMirrorCheck.IsChecked;
+
+  // Used when the pose does not come from the camera of the application
+  FTimer          := TTimer.Create(Self);
+  FTimer.Enabled  := False;
+  FTimer.Interval := 33;
+  FTimer.OnTimer  := BridgeTimer;
 end;
 
 procedure TMainForm.BuildScene;
@@ -349,6 +361,7 @@ begin
   end;
 
   FSolver.Reset;
+  StartSource;
 end;
 
 procedure TMainForm.LoadBodyModel(const aFile : string);
@@ -381,7 +394,38 @@ begin
   FCamera                     := TCameraComponent.Create(Self);
   FCamera.Quality             := TVideoCaptureQuality.MediumQuality;
   FCamera.OnSampleBufferReady := CameraFrame;
-  FCamera.Active              := True;
+
+  StartSource;
+end;
+
+// The camera of the application or the timer (MediaPipe bridge) feeds the pose.
+procedure TMainForm.StartSource;
+begin
+  FTimer.Enabled := False;
+
+  if (FCamera <> nil) then
+    FCamera.Active := False;
+
+  if (FPose = nil) then exit;
+
+  if FPose.UsesCamera then
+    begin
+      if (FCamera <> nil) then FCamera.Active := True;
+    end
+   else
+    FTimer.Enabled := True;
+end;
+
+procedure TMainForm.BridgeTimer(Sender : TObject);
+var
+  TempStart : Double;
+  TempResult : TPoseResult;
+begin
+  if (FPose = nil) or (FAvatar = nil) then exit;
+
+  TempStart  := FWatch.Elapsed.TotalSeconds;
+  TempResult := FPose.Estimate(nil, 0, 0, 0, False);
+  HandleResult(TempResult, TempStart);
 end;
 
 procedure TMainForm.PoseChanged(Sender : TObject);
@@ -424,10 +468,9 @@ procedure TMainForm.CameraFrame(Sender : TObject; const ATime : TMediaTime);
 var
   TempData : TBitmapData;
   TempResult : TPoseResult;
-  TempPose : TAvatarPose;
-  TempNow, TempStart, TempMs : Double;
+  TempStart : Double;
 begin
-  if (FPose = nil) or (FAvatar = nil) then exit;
+  if (FPose = nil) or (FAvatar = nil) or not(FPose.UsesCamera) then exit;
 
   FCamera.SampleBufferToBitmap(FFrame, True);
 
@@ -451,22 +494,30 @@ begin
         exit;
       end;
   end;
-  TempNow := FWatch.Elapsed.TotalSeconds;
-  TempMs  := (TempNow - TempStart) * 1000;
+  HandleResult(TempResult, TempStart);
+end;
 
-  if TempResult.Found then
+procedure TMainForm.HandleResult(const aResult : TPoseResult; aStart : Double);
+var
+  TempPose : TAvatarPose;
+  TempNow, TempMs : Double;
+begin
+  TempNow := FWatch.Elapsed.TotalSeconds;
+  TempMs  := (TempNow - aStart) * 1000;
+
+  if aResult.Found then
     begin
-      if TempResult.Has3D then
-        TempPose := FSolver.Solve3D(TempResult.Keypoints, TempResult.World, FFrame.Width, FFrame.Height, TempNow)
+      if aResult.Has3D then
+        TempPose := FSolver.Solve3D(aResult.Keypoints, aResult.World, aResult.FrameWidth, aResult.FrameHeight, TempNow)
        else
-        TempPose := FSolver.Solve(TempResult.Keypoints, FFrame.Width, FFrame.Height, TempNow);
+        TempPose := FSolver.Solve(aResult.Keypoints, aResult.FrameWidth, aResult.FrameHeight, TempNow);
 
       FAvatar.ApplyPose(TempPose);
     end
    else
     TempPose.Valid := False;
 
-  DrawKeypoints(TempResult);
+  DrawKeypoints(aResult, FPose.UsesCamera);
 
   if (FLastFrame > 0) and (TempNow > FLastFrame) then
     FFps := (0.9 * FFps) + (0.1 / (TempNow - FLastFrame));
@@ -475,28 +526,43 @@ begin
   if TempPose.Valid then
     FStatus.Text := Format('%s'#13#10'%.0f FPS, inference %.1f ms', [FPose.Name, FFps, TempMs])
    else
-    FStatus.Text := 'No body found. Stand in front of the camera, so that the shoulders and hips are visible.';
+    if FPose.UsesCamera then
+      FStatus.Text := 'No body found. Stand in front of the camera, so that the shoulders and hips are visible.'
+     else
+      FStatus.Text := 'Waiting for the MediaPipe bridge : python tools/mediapipe_bridge.py --model pose_landmarker_full.task';
 end;
 
-procedure TMainForm.DrawKeypoints(const aResult : TPoseResult);
+procedure TMainForm.DrawKeypoints(const aResult : TPoseResult; aFromCamera : boolean);
 var
   i : integer;
+  TempCanvas : TCanvas;
 begin
-  FPreview.Bitmap.Assign(FFrame);
+  if aFromCamera then
+    FPreview.Bitmap.Assign(FFrame)
+   else
+    begin
+      // No camera image : a black image with the keypoints.
+      if (aResult.FrameWidth < 1) or (aResult.FrameHeight < 1) then exit;
+
+      FPreview.Bitmap.SetSize(round(aResult.FrameWidth), round(aResult.FrameHeight));
+      FPreview.Bitmap.Clear(TAlphaColors.Black);
+    end;
 
   if not(aResult.Found) then exit;
 
-  if FPreview.Bitmap.Canvas.BeginScene then
+  TempCanvas := FPreview.Bitmap.Canvas;
+
+  if TempCanvas.BeginScene then
     try
-      FPreview.Bitmap.Canvas.Fill.Color := TAlphaColors.Lime;
+      TempCanvas.Fill.Color := TAlphaColors.Lime;
 
       for i := 0 to pred(KEYPOINT_COUNT) do
         if (aResult.Keypoints[i].Score >= FSolver.MinScore) then
-          FPreview.Bitmap.Canvas.FillEllipse(
+          TempCanvas.FillEllipse(
             RectF(aResult.Keypoints[i].X - 5, aResult.Keypoints[i].Y - 5,
                   aResult.Keypoints[i].X + 5, aResult.Keypoints[i].Y + 5), 1);
     finally
-      FPreview.Bitmap.Canvas.EndScene;
+      TempCanvas.EndScene;
     end;
 end;
 

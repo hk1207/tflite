@@ -9,7 +9,7 @@ unit uTFLite;
 interface
 
 uses
-  Winapi.Windows, System.SysUtils;
+  Winapi.Windows, System.SysUtils, uInference;
 
 const
   TFLITE_DLL = 'tensorflowlite_c.dll';
@@ -23,12 +23,12 @@ const
   kTfLiteOk = 0;
 
 type
-  ETFLiteError = class(Exception);
+  ETFLiteError = class(EInferenceError);
 
   /// <summary>
   /// A loaded model and its interpreter.
   /// </summary>
-  TTFLiteInterpreter = class
+  TTFLiteInterpreter = class(TInferenceEngine)
     protected
       FModel       : Pointer;
       FOptions     : Pointer;
@@ -51,17 +51,17 @@ type
       /// 0..255 multiplied by aFloatScale (1/255 for BlazePose), uint8 models
       /// the bytes and int32 models the integers.
       /// </summary>
-      procedure SetInputRGB(aRGB : PByte; aWidth, aHeight : integer; aFloatScale : Single = 1);
-      procedure Invoke;
-      /// <summary>
-      /// Reads the float32 output tensor aIndex.
-      /// </summary>
-      procedure ReadOutput(aIndex : integer; out aData : TArray<Single>);
-      /// <summary>
-      /// Number of output tensors and number of values of an output tensor.
-      /// </summary>
-      function  OutputCount : integer;
-      function  OutputValueCount(aIndex : integer) : integer;
+      procedure SetInputRGB(aRGB : PByte; aWidth, aHeight : integer; aFloatScale : Single = 1); override;
+      procedure Invoke; override;
+      procedure ReadOutput(aIndex : integer; out aData : TSingleArray); override;
+      function  OutputCount : integer; override;
+      function  OutputValueCount(aIndex : integer) : integer; override;
+      function  OutputDimCount(aIndex : integer) : integer; override;
+      function  OutputDim(aIndex, aDim : integer) : integer; override;
+
+      function  InputWidth : integer; override;
+      function  InputHeight : integer; override;
+      function  InputChannelsFirst : boolean; override;
 
       property InputType : integer read FInputType;
       function InputDim(aIndex : integer) : integer;
@@ -218,6 +218,52 @@ begin
   Result := FInputDims[aIndex];
 end;
 
+function TTFLiteInterpreter.InputWidth : integer;
+begin
+  // [1, height, width, 3]
+  if (length(FInputDims) = 4) then
+    Result := FInputDims[2]
+   else
+    Result := 0;
+end;
+
+function TTFLiteInterpreter.InputHeight : integer;
+begin
+  if (length(FInputDims) = 4) then
+    Result := FInputDims[1]
+   else
+    Result := 0;
+end;
+
+function TTFLiteInterpreter.InputChannelsFirst : boolean;
+begin
+  Result := False;
+end;
+
+function TTFLiteInterpreter.OutputDimCount(aIndex : integer) : integer;
+var
+  TempTensor : Pointer;
+begin
+  TempTensor := GetOutputTensor(FInterpreter, aIndex);
+
+  if (TempTensor = nil) then
+    Result := 0
+   else
+    Result := TensorNumDims(TempTensor);
+end;
+
+function TTFLiteInterpreter.OutputDim(aIndex, aDim : integer) : integer;
+var
+  TempTensor : Pointer;
+begin
+  TempTensor := GetOutputTensor(FInterpreter, aIndex);
+
+  if (TempTensor = nil) then
+    Result := 0
+   else
+    Result := TensorDim(TempTensor, aDim);
+end;
+
 function TTFLiteInterpreter.InputDimCount : integer;
 begin
   Result := length(FInputDims);
@@ -227,7 +273,7 @@ procedure TTFLiteInterpreter.SetInputRGB(aRGB : PByte; aWidth, aHeight : integer
 var
   TempTensor : Pointer;
   TempCount, i : integer;
-  TempFloats : TArray<Single>;
+  TempFloats : TSingleArray;
   TempInts : TArray<Int32>;
 begin
   TempTensor := GetInputTensor(FInterpreter, 0);
@@ -282,7 +328,7 @@ begin
     Result := TensorByteSize(TempTensor) div SizeOf(Single);
 end;
 
-procedure TTFLiteInterpreter.ReadOutput(aIndex : integer; out aData : TArray<Single>);
+procedure TTFLiteInterpreter.ReadOutput(aIndex : integer; out aData : TSingleArray);
 var
   TempTensor : Pointer;
   TempBytes : NativeUInt;

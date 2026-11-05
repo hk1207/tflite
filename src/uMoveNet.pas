@@ -9,19 +9,19 @@ unit uMoveNet;
 interface
 
 uses
-  System.SysUtils, uTFLite, uPoseSolver, uPoseEstimator;
+  System.SysUtils, uInference, uPoseSolver, uPoseEstimator;
 
 type
   TMoveNet = class(TPoseEstimator)
     protected
-      FInterpreter : TTFLiteInterpreter;
+      FInterpreter : TInferenceEngine;
       FInputSize   : integer;
       FInput       : TBytes;
     public
       /// <summary>
       /// The estimator owns aInterpreter.
       /// </summary>
-      constructor Create(aInterpreter : TTFLiteInterpreter);
+      constructor Create(aInterpreter : TInferenceEngine);
       destructor  Destroy; override;
 
       function Name : string; override;
@@ -38,18 +38,17 @@ implementation
 uses
   uPoseImage;
 
-constructor TMoveNet.Create(aInterpreter : TTFLiteInterpreter);
+constructor TMoveNet.Create(aInterpreter : TInferenceEngine);
 begin
   inherited Create;
 
   FInterpreter := aInterpreter;
 
   // Input : [1, height, width, 3]
-  if (FInterpreter.InputDimCount <> 4) or (FInterpreter.InputDim(3) <> 3) or
-     (FInterpreter.InputDim(1) <> FInterpreter.InputDim(2)) then
-    raise ETFLiteError.Create('This is not a MoveNet SinglePose model (the input must be [1, N, N, 3])');
+  if (FInterpreter.InputWidth <= 0) or (FInterpreter.InputWidth <> FInterpreter.InputHeight) then
+    raise EInferenceError.Create('This is not a MoveNet SinglePose model (the input must be a square image)');
 
-  FInputSize := FInterpreter.InputDim(1);
+  FInputSize := FInterpreter.InputWidth;
   SetLength(FInput, FInputSize * FInputSize * 3);
 end;
 
@@ -67,10 +66,12 @@ end;
 
 function TMoveNet.Estimate(aFrame : Pointer; aW, aH, aPitch : integer; aBGRA : boolean) : TPoseResult;
 var
-  TempOutput : TArray<Single>;
+  TempOutput : TSingleArray;
   TempCropX, TempCropY, TempCropSize, i : integer;
 begin
   FillChar(Result, SizeOf(Result), 0);
+  Result.FrameWidth  := aW;
+  Result.FrameHeight := aH;
 
   CropResizeToRGB(aFrame, aW, aH, aPitch, aBGRA, @FInput[0], FInputSize,
                   TempCropX, TempCropY, TempCropSize);
@@ -80,7 +81,7 @@ begin
   FInterpreter.ReadOutput(0, TempOutput);
 
   if (length(TempOutput) < (KEYPOINT_COUNT * 3)) then
-    raise ETFLiteError.Create('Unexpected output of the model');
+    raise EInferenceError.Create('Unexpected output of the model');
 
   for i := 0 to pred(KEYPOINT_COUNT) do
     begin

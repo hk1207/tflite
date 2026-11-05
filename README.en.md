@@ -8,11 +8,13 @@ movements. The 3D rendering uses
 [Castle Game Engine](https://github.com/hk1207/castle-engine).
 
 * Delphi FMX, Windows, webcam input
-* Pose model : **BlazePose (3D)** or **MoveNet (2D)**
+* Pose model : **BlazePose (3D)**, **MoveNet (2D)**, **YOLO pose (2D)**, **MediaPipe (3D, Python bridge)**
+* Inference engine : **TensorFlow Lite** (`.tflite`) or **ONNX Runtime** (`.onnx`)
 * 3D human model : `ghwmaq.glb`, `GHWBodyModel.glb` (the zip can be used as it is)
 
 ```
-webcam frame --> pose model (BlazePose 3D / MoveNet 2D) --> 17 keypoints (+ 3D positions)
+webcam frame --> pose model (TFLite / ONNX Runtime) --> 17 keypoints (+ 3D positions)
+(or Python MediaPipe bridge --UDP--> 33 landmarks + 3D positions)
    --> smoothing + 3D joints (uPoseSolver) --> bone rotations (uPoseRig)
    --> rigged glTF model (uRiggedAvatar)
 ```
@@ -21,11 +23,16 @@ webcam frame --> pose model (BlazePose 3D / MoveNet 2D) --> 17 keypoints (+ 3D p
 
 | Folder/file | Content |
 | --- | --- |
+| `src/uInference.pas` | Common interface of the inference engines (TFLite and ONNX Runtime share the model code) |
 | `src/uTFLite.pas` | TensorFlow Lite C API binding (`tensorflowlite_c.dll` is loaded at run time) |
+| `src/uOnnxRuntime.pas` | ONNX Runtime C API binding (`onnxruntime.dll` is loaded at run time) |
 | `src/uPoseEstimator.pas` | Common interface of the pose models |
 | `src/uMoveNet.pas` | MoveNet SinglePose (Lightning/Thunder), 2D |
 | `src/uBlazePose.pas`, `src/uBlazeDecode.pas` | BlazePose landmark model, 3D world coordinates, body tracking |
-| `src/uPoseModels.pas` | Opens a `.tflite` file and detects the kind of model |
+| `src/uYoloPose.pas`, `src/uYoloDecode.pas` | YOLOv8/11-pose ONNX models, 2D |
+| `src/uMediaPipeBridge.pas`, `src/uMediaPipeProtocol.pas` | Receives the MediaPipe (Python) bridge (UDP) |
+| `src/uPoseModels.pas` | Opens a `.tflite`/`.onnx` file and detects the kind of model |
+| `tools/mediapipe_bridge.py` | Python program : runs the MediaPipe Pose Landmarker on the webcam and sends it over UDP |
 | `src/uPoseImage.pas` | Crops the camera frame and converts it to the model input (RGB) |
 | `src/uPoseSolver.pas` | Smoothing, scale, 2D/3D keypoints -> 3D joints of the body |
 | `src/uPoseRig.pas` | Joints -> rotations of the model bones. Profile of each model |
@@ -36,18 +43,41 @@ webcam frame --> pose model (BlazePose 3D / MoveNet 2D) --> 17 keypoints (+ 3D p
 
 ## Pose models
 
-| Model | Output | Notes |
-| --- | --- | --- |
-| **BlazePose** (MediaPipe) | 33 landmarks + **3D world coordinates (meters)** | The depth and the turn of the body are **measured**. Recommended |
-| **MoveNet** (Lightning/Thunder) | 17 2D keypoints | Fast and simple. The depth is **estimated** from the bone lengths |
+| Model | File | Output | Notes |
+| --- | --- | --- | --- |
+| **BlazePose** (MediaPipe) | `.tflite` or `.onnx` | 33 landmarks + **3D world coordinates (meters)** | The depth and the turn of the body are **measured**. Recommended |
+| **MediaPipe bridge** | (Python program) | 33 landmarks + **3D world coordinates** | The official MediaPipe as it is (with its pose detector, most accurate) |
+| **MoveNet** (Lightning/Thunder) | `.tflite` or `.onnx` | 17 2D keypoints | Fast and simple. The depth is **estimated** from the bone lengths |
+| **YOLO pose** (v8/11) | `.onnx` | 17 2D keypoints | Finds the person first. The depth is **estimated** |
 
-See [models/README.md](models/README.md) to download them. Put the `.tflite` file in
-`models/`; the application finds it and you can select it in the left panel.
-A MediaPipe `.task` file works as it is.
+The kind of the model is detected from the shape of its outputs. Put the `.tflite`/`.onnx` file in
+`models/`; the application finds it and you can select it in the left panel. See
+[models/README.md](models/README.md) to download them. A MediaPipe `.task` file works as it is.
+
+### ONNX Runtime
+
+An `.onnx` file runs with `onnxruntime.dll` (1.14 or newer). Inputs `[1,H,W,3]` and `[1,3,H,W]` are
+supported, with float32 or uint8 values. ONNX versions of BlazePose and MoveNet and YOLOv8/11-pose
+models work. Only float32 outputs are supported (no float16 models). See [bin/README.md](bin/README.md)
+for the DLL.
+
+### MediaPipe (Python bridge)
+
+MediaPipe is a C++/Python library, so Delphi can't call it directly. A Python program runs the MediaPipe
+Pose Landmarker and sends the result to the application over UDP (127.0.0.1:5005).
+
+```
+pip install -r tools/requirements.txt
+python tools/mediapipe_bridge.py --model pose_landmarker_full.task
+```
+
+Then select **MediaPipe (Python bridge ...)** in the pose model list of the application. A webcam can only
+be opened by one program : in this mode Python opens the camera and the application doesn't use its own.
+There are also `--video file.mp4`, `--image picture.jpg` and `--preview` (a preview window in Python).
 
 Other ways to measure a 3D pose (not in this application yet) :
 
-* 2D -> 3D lifting models : VideoPose3D, MotionBERT (PyTorch/ONNX, they need an ONNX Runtime binding)
+* 2D -> 3D lifting models : VideoPose3D, MotionBERT (convert to ONNX and write a new `TPoseEstimator`)
 * Human mesh recovery : HMR2.0 / 4DHumans, ROMP, WHAM (SMPL model, GPU needed)
 * Depth cameras : Azure Kinect Body Tracking, Intel RealSense, ZED (hardware needed)
 * To add a model, inherit `TPoseEstimator` (`src/uPoseEstimator.pas`) and implement `Estimate`.
@@ -71,14 +101,15 @@ work. For another rigged model add a profile (bone names, parents, roles) in `sr
 
 1. **Castle Game Engine** : get https://github.com/hk1207/castle-engine and install its Delphi packages
    (`packages/delphi/AllPackages.groupproj`, install all except `castle_engine_window`).
-2. Get a pose model (`.tflite`) and **`tensorflowlite_c.dll`**
-   ([models/README.md](models/README.md), [bin/README.md](bin/README.md)).
+2. Get a pose model and the DLL of its engine : `.tflite` -> **`tensorflowlite_c.dll`**,
+   `.onnx` -> **`onnxruntime.dll`** ([models/README.md](models/README.md), [bin/README.md](bin/README.md)).
+   No DLL is needed if you only use the MediaPipe bridge.
 3. Open `app/PoseMotion.dpr` in Delphi, build for **Windows 64-bit** and run it.
    Put the DLL next to the executable.
 4. Stand 2-3 m from the camera, so that the whole body is visible, face the camera and press
    **Calibrate again**.
 
-Command line : `PoseMotion.exe [pose model .tflite/.task] [3D model .glb/.zip]`
+Command line : `PoseMotion.exe [pose model .tflite/.onnx/.task or udp://127.0.0.1:5005] [3D model .glb/.zip]`
 
 ## From pose to 3D
 
@@ -87,7 +118,8 @@ Command line : `PoseMotion.exe [pose model .tflite/.task] [3D model .glb/.zip]`
   far from the camera.
 * **BlazePose** : the limbs follow the directions of the 3D world positions, the shoulder line gives
   the turn of the body and the nose and ears give the turn of the head.
-* **MoveNet** : the missing length of a bone is the depth. The direction can't be seen, so elbows and
+* **MediaPipe bridge** : uses the 3D world positions like BlazePose.
+* **MoveNet / YOLO pose** : the missing length of a bone is the depth. The direction can't be seen, so elbows and
   knees bend to the camera by default. If they move the wrong way, tick **Flip the depth direction**.
 * For each bone, the rotation "direction at rest -> measured direction" is applied to the model bone.
 
@@ -102,12 +134,14 @@ fpc -Mdelphi -Fu../src TestPose.pas
 ./TestPose
 ```
 
-The TensorFlow Lite binding, the camera, the Castle Game Engine model loading and the form need
-Delphi on Windows and were **not compiled or run yet**.
+The TensorFlow Lite / ONNX Runtime bindings, the UDP receiver, the camera, the Castle Game Engine model
+loading and the form need Delphi on Windows and were **not compiled or run yet**. `tools/mediapipe_bridge.py`
+was not run with MediaPipe either : only the format of the line that it sends (`--selftest`) is tested with
+the Pascal parser.
 
 ## Limits
 
-* The BlazePose pose detector model is not used. The first frame uses the square at the center of the
+* BlazePose run directly from `.tflite`/`.onnx` doesn't use the pose detector model (the MediaPipe bridge does). The first frame uses the square at the center of the
   image, so the person has to stand in the middle with the whole body visible. Then the body is tracked.
 * Fingers, toes and face expressions don't move (the hand follows the forearm).
 * One camera only : hidden parts are not accurate.

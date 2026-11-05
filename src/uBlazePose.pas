@@ -13,12 +13,12 @@ unit uBlazePose;
 interface
 
 uses
-  System.SysUtils, uTFLite, uPoseSolver, uPoseEstimator, uBlazeDecode;
+  System.SysUtils, uInference, uPoseSolver, uPoseEstimator, uBlazeDecode;
 
 type
   TBlazePose = class(TPoseEstimator)
     protected
-      FInterpreter : TTFLiteInterpreter;
+      FInterpreter : TInferenceEngine;
       FInputSize   : integer;
       FInput       : TBytes;
       FLandmarksIdx, FWorldIdx, FPresenceIdx : integer;
@@ -28,7 +28,7 @@ type
       /// <summary>
       /// The estimator owns aInterpreter.
       /// </summary>
-      constructor Create(aInterpreter : TTFLiteInterpreter);
+      constructor Create(aInterpreter : TInferenceEngine);
       destructor  Destroy; override;
 
       function Name : string; override;
@@ -38,7 +38,7 @@ type
       /// <summary>
       /// True if aInterpreter looks like a BlazePose landmark model.
       /// </summary>
-      class function IsBlazePose(aInterpreter : TTFLiteInterpreter) : boolean;
+      class function IsBlazePose(aInterpreter : TInferenceEngine) : boolean;
   end;
 
 implementation
@@ -46,7 +46,7 @@ implementation
 uses
   uPoseImage;
 
-class function TBlazePose.IsBlazePose(aInterpreter : TTFLiteInterpreter) : boolean;
+class function TBlazePose.IsBlazePose(aInterpreter : TInferenceEngine) : boolean;
 var
   i : integer;
 begin
@@ -57,7 +57,7 @@ begin
       Result := True;
 end;
 
-constructor TBlazePose.Create(aInterpreter : TTFLiteInterpreter);
+constructor TBlazePose.Create(aInterpreter : TInferenceEngine);
 var
   i, TempCount : integer;
 begin
@@ -65,11 +65,10 @@ begin
 
   FInterpreter := aInterpreter;
 
-  if (FInterpreter.InputDimCount <> 4) or (FInterpreter.InputDim(3) <> 3) or
-     (FInterpreter.InputDim(1) <> FInterpreter.InputDim(2)) then
-    raise ETFLiteError.Create('This is not a BlazePose landmark model (the input must be [1, N, N, 3])');
+  if (FInterpreter.InputWidth <= 0) or (FInterpreter.InputWidth <> FInterpreter.InputHeight) then
+    raise EInferenceError.Create('This is not a BlazePose landmark model (the input must be a square image)');
 
-  FInputSize := FInterpreter.InputDim(1);
+  FInputSize := FInterpreter.InputWidth;
   SetLength(FInput, FInputSize * FInputSize * 3);
 
   FLandmarksIdx := -1;
@@ -91,7 +90,7 @@ begin
     end;
 
   if (FLandmarksIdx < 0) then
-    raise ETFLiteError.Create('This is not a BlazePose landmark model (no output with 195 values)');
+    raise EInferenceError.Create('This is not a BlazePose landmark model (no output with 195 values)');
 
   FTracking := False;
 end;
@@ -118,11 +117,13 @@ end;
 
 function TBlazePose.Estimate(aFrame : Pointer; aW, aH, aPitch : integer; aBGRA : boolean) : TPoseResult;
 var
-  TempLandmarks, TempWorld, TempPresence : TArray<Single>;
+  TempLandmarks, TempWorld, TempPresence : TSingleArray;
   TempNext : TBlazeRoi;
   TempFlag : Single;
 begin
   FillChar(Result, SizeOf(Result), 0);
+  Result.FrameWidth  := aW;
+  Result.FrameHeight := aH;
 
   if not(FTracking) then
     BlazeFullFrameRoi(aW, aH, FRoi);

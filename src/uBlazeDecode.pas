@@ -100,6 +100,8 @@ begin
   TempTop    := aRoi.CY - (aRoi.Side / 2);
   TempFactor := aRoi.Side / aInputSize;
 
+  aResult.FrameWidth  := aFrameW;
+  aResult.FrameHeight := aFrameH;
   aResult.Has3D := (length(aWorld) >= BLAZE_WORLD_SIZE);
 
   for i := 0 to pred(KEYPOINT_COUNT) do

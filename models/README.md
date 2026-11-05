@@ -36,3 +36,16 @@ Outputs : 195 landmark values, 117 world landmark values, 1 pose flag (found by 
 
 모델 입력은 float32 (0..255), uint8, int32를 지원하며 int8 양자화 모델은 지원하지 않습니다. /
 The input can be float32 (0..255), uint8 or int32; the int8 quantized variants are not supported.
+
+### ONNX (`.onnx`)
+
+* BlazePose / MoveNet : ONNX 변환 모델 (예: PINTO model zoo) 또는 직접 변환 /
+  ONNX versions (for example the PINTO model zoo) or convert them yourself.
+* YOLO pose : `yolo export model=yolov8n-pose.pt format=onnx imgsz=640` (Ultralytics).
+  출력 `[1, 56, 8400]` / Output `[1, 56, 8400]`.
+* 입력 `[1,H,W,3]` 또는 `[1,3,H,W]`, float32/uint8, 고정 크기 / Input `[1,H,W,3]` or `[1,3,H,W]`, float32/uint8, fixed size.
+
+### MediaPipe (Python 브리지 / bridge)
+
+`pose_landmarker_full.task`를 받아 `python tools/mediapipe_bridge.py --model pose_landmarker_full.task`로
+실행하세요. / Download `pose_landmarker_full.task` and run the command above.
