@@ -19,6 +19,10 @@ webcam frame --> pose model (TFLite / ONNX Runtime) --> 17 keypoints (+ 3D posit
    --> rigged glTF model (uRiggedAvatar)
 ```
 
+![Screenshot mockup](docs/app_mockup.png)
+
+*A mockup, not a real Windows capture. The pose of the 3D model is what the pose solver and the bone rotation code of this project give for `models/ghwmaq.glb`; the window styling (colors, fonts) is invented. It will be replaced by a real screenshot once the application has been run.*
+
 ## Folders
 
 | Folder/file | Content |
