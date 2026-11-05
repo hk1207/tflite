@@ -49,7 +49,7 @@ type
       function  InputWidth : integer; override;
       function  InputHeight : integer; override;
       function  InputChannelsFirst : boolean; override;
-      procedure SetInputRGB(aRGB : PByte; aWidth, aHeight : integer; aFloatScale : Single = 1); override;
+      procedure SetInputRGB(aRGB : PByte; aWidth, aHeight : integer; aFloatScale : Single = 1; aFloatOffset : Single = 0); override;
       procedure Invoke; override;
       function  OutputCount : integer; override;
       function  OutputValueCount(aIndex : integer) : integer; override;
@@ -357,7 +357,7 @@ begin
   Result := FChannelsFirst;
 end;
 
-procedure TOnnxEngine.SetInputRGB(aRGB : PByte; aWidth, aHeight : integer; aFloatScale : Single);
+procedure TOnnxEngine.SetInputRGB(aRGB : PByte; aWidth, aHeight : integer; aFloatScale : Single; aFloatOffset : Single);
 var
   TempPixels, i, c : integer;
   TempValue : Byte;
@@ -375,9 +375,9 @@ begin
         if (FInputType = ONNX_FLOAT) then
           begin
             if FChannelsFirst then
-              FInputFloats[(c * TempPixels) + i] := TempValue * aFloatScale
+              FInputFloats[(c * TempPixels) + i] := (TempValue * aFloatScale) + aFloatOffset
              else
-              FInputFloats[(i * 3) + c] := TempValue * aFloatScale;
+              FInputFloats[(i * 3) + c] := (TempValue * aFloatScale) + aFloatOffset;
           end
          else
           begin

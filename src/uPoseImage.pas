@@ -35,6 +35,17 @@ procedure CropRegionToRGB(aSrc : Pointer; aW, aH, aPitch : integer; aBGRA : bool
                           aCenterX, aCenterY, aSide : Single;
                           aDst : Pointer; aDstSize : integer);
 
+/// <summary>
+/// Same as CropRegionToRGB for a square that is rotated by aRotation radians
+/// (clockwise in the image, y down) around its center. The model sees the
+/// square upright : a point of the model image (u, v) relative to the center
+/// (units of the frame) is at the frame position
+///   x = aCenterX + u cos(r) - v sin(r),  y = aCenterY + u sin(r) + v cos(r).
+/// </summary>
+procedure CropRotatedToRGB(aSrc : Pointer; aW, aH, aPitch : integer; aBGRA : boolean;
+                           aCenterX, aCenterY, aSide, aRotation : Single;
+                           aDst : Pointer; aDstSize : integer);
+
 implementation
 
 procedure CropResizeToRGB(aSrc : Pointer; aW, aH, aPitch : integer; aBGRA : boolean;
@@ -107,10 +118,17 @@ end;
 procedure CropRegionToRGB(aSrc : Pointer; aW, aH, aPitch : integer; aBGRA : boolean;
                           aCenterX, aCenterY, aSide : Single;
                           aDst : Pointer; aDstSize : integer);
+begin
+  CropRotatedToRGB(aSrc, aW, aH, aPitch, aBGRA, aCenterX, aCenterY, aSide, 0, aDst, aDstSize);
+end;
+
+procedure CropRotatedToRGB(aSrc : Pointer; aW, aH, aPitch : integer; aBGRA : boolean;
+                           aCenterX, aCenterY, aSide, aRotation : Single;
+                           aDst : Pointer; aDstSize : integer);
 var
   TempSrc, TempDst : PPixelBytes;
-  x, y, x0, y0, x1, y1, c : integer;
-  TempLeft, TempTop, TempRatio, TempSx, TempSy, TempFx, TempFy, TempValue : Single;
+  x, y, x0, y0, c : integer;
+  TempRatio, TempU, TempV, TempSx, TempSy, TempFx, TempFy, TempValue, TempCos, TempSin : Single;
   TempIdx : array[0..2] of integer;
 
   function Pixel(aX, aY, aC : integer) : Single;
@@ -134,35 +152,35 @@ begin
       TempIdx[0] := 0; TempIdx[1] := 1; TempIdx[2] := 2;
     end;
 
-  TempLeft  := aCenterX - (aSide / 2);
-  TempTop   := aCenterY - (aSide / 2);
   TempRatio := aSide / aDstSize;
+  TempCos   := Cos(aRotation);
+  TempSin   := Sin(aRotation);
 
   for y := 0 to pred(aDstSize) do
-    begin
-      TempSy := TempTop + (((y + 0.5) * TempRatio) - 0.5);
-      y0     := Floor(TempSy);
-      y1     := y0 + 1;
-      TempFy := TempSy - y0;
+    for x := 0 to pred(aDstSize) do
+      begin
+        // Position relative to the center of the square, in pixels of the frame
+        TempU := ((x + 0.5) * TempRatio) - (aSide / 2);
+        TempV := ((y + 0.5) * TempRatio) - (aSide / 2);
 
-      for x := 0 to pred(aDstSize) do
-        begin
-          TempSx := TempLeft + (((x + 0.5) * TempRatio) - 0.5);
-          x0     := Floor(TempSx);
-          x1     := x0 + 1;
-          TempFx := TempSx - x0;
+        TempSx := aCenterX + (TempU * TempCos) - (TempV * TempSin) - 0.5;
+        TempSy := aCenterY + (TempU * TempSin) + (TempV * TempCos) - 0.5;
 
-          for c := 0 to 2 do
-            begin
-              TempValue := (Pixel(x0, y0, c) * (1 - TempFx) * (1 - TempFy)) +
-                           (Pixel(x1, y0, c) * TempFx * (1 - TempFy)) +
-                           (Pixel(x0, y1, c) * (1 - TempFx) * TempFy) +
-                           (Pixel(x1, y1, c) * TempFx * TempFy);
+        x0     := Floor(TempSx);
+        y0     := Floor(TempSy);
+        TempFx := TempSx - x0;
+        TempFy := TempSy - y0;
 
-              TempDst^[(((y * aDstSize) + x) * 3) + c] := Byte(round(TempValue));
-            end;
-        end;
-    end;
+        for c := 0 to 2 do
+          begin
+            TempValue := (Pixel(x0, y0, c) * (1 - TempFx) * (1 - TempFy)) +
+                         (Pixel(x0 + 1, y0, c) * TempFx * (1 - TempFy)) +
+                         (Pixel(x0, y0 + 1, c) * (1 - TempFx) * TempFy) +
+                         (Pixel(x0 + 1, y0 + 1, c) * TempFx * TempFy);
+
+            TempDst^[(((y * aDstSize) + x) * 3) + c] := Byte(round(TempValue));
+          end;
+      end;
 end;
 
 end.

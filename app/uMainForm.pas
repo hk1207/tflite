@@ -172,6 +172,10 @@ begin
 
   for TempFile in TDirectory.GetFiles(aDir, aPattern) do
     begin
+      // The detector model of BlazePose is used together with the landmark model.
+      if (aList = FPoseFiles) and ExtractFileName(TempFile).ToLower.Contains('detect') then
+        continue;
+
       TempFound := False;
 
       for i := 0 to pred(aList.Count) do
@@ -254,11 +258,21 @@ begin
     Result := aFile;
 end;
 
-// A pose model can be a MediaPipe .task file : a zip with the landmark model.
+// A pose model can be a MediaPipe .task file : a zip with the landmark model
+// and the pose detector. Both are extracted to the same folder, so the detector
+// is found next to the landmark model.
 function TMainForm.ResolvePoseFile(const aFile : string) : string;
 begin
   if SameText(ExtractFileExt(aFile), '.task') then
-    Result := ExtractFromZip(aFile, 'landmarks_detector.tflite')
+    begin
+      try
+        ExtractFromZip(aFile, 'pose_detector.tflite');
+      except
+        // a .task without the detector : the landmark model is used alone
+      end;
+
+      Result := ExtractFromZip(aFile, 'landmarks_detector.tflite');
+    end
    else
     Result := aFile;
 end;

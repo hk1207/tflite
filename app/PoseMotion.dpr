@@ -19,6 +19,7 @@ uses
   uPoseRig in '..\src\uPoseRig.pas',
   uPoseEstimator in '..\src\uPoseEstimator.pas',
   uBlazeDecode in '..\src\uBlazeDecode.pas',
+  uBlazeDetect in '..\src\uBlazeDetect.pas',
   uMoveNet in '..\src\uMoveNet.pas',
   uBlazePose in '..\src\uBlazePose.pas',
   uYoloDecode in '..\src\uYoloDecode.pas',

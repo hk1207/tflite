@@ -29,7 +29,16 @@ type
   /// </summary>
   TBlazeRoi = record
     CX, CY, Side : Single;
+    Rotation     : Single;   // radians, clockwise in the image (y down), 0 = upright
   end;
+
+/// <summary>
+/// The square of MediaPipe for a body : centered at (aX0, aY0) (the body center),
+/// with a side of aScale * 2 * the distance to (aX1, aY1) (a point on the circle
+/// that surrounds the body), rotated so that the line from the first to the
+/// second point is vertical. aScale is 1.25 in MediaPipe.
+/// </summary>
+procedure BlazeRoiFromPoints(aX0, aY0, aX1, aY1, aScale : Single; out aRoi : TBlazeRoi);
 
 /// <summary>
 /// The biggest square at the center of the frame.
@@ -61,10 +70,29 @@ begin
   Result := 1 / (1 + Exp(-aValue));
 end;
 
+procedure BlazeRoiFromPoints(aX0, aY0, aX1, aY1, aScale : Single; out aRoi : TBlazeRoi);
+var
+  TempAngle : Single;
+begin
+  aRoi.CX   := aX0;
+  aRoi.CY   := aY0;
+  aRoi.Side := 2 * Sqrt(Sqr(aX1 - aX0) + Sqr(aY1 - aY0)) * aScale;
+
+  // target angle 90 degrees : the vector from the first to the second point looks up.
+  TempAngle := (Pi / 2) - ArcTan2(-(aY1 - aY0), aX1 - aX0);
+
+  // to -Pi..Pi
+  while (TempAngle > Pi) do TempAngle := TempAngle - (2 * Pi);
+  while (TempAngle < -Pi) do TempAngle := TempAngle + (2 * Pi);
+
+  aRoi.Rotation := TempAngle;
+end;
+
 procedure BlazeFullFrameRoi(aW, aH : Single; out aRoi : TBlazeRoi);
 begin
   aRoi.CX := aW / 2;
   aRoi.CY := aH / 2;
+  aRoi.Rotation := 0;
 
   if (aW < aH) then
     aRoi.Side := aW
@@ -77,17 +105,22 @@ procedure BlazeDecode(const aLandmarks, aWorld : array of Single; aInputSize : i
                       out aResult : TPoseResult; out aNextRoi : TBlazeRoi);
 var
   i, TempLm : integer;
-  TempLeft, TempTop, TempFactor : Single;
-  TempX33, TempY33, TempX34, TempY34, TempRadius, TempSide, TempMin, TempMax : Single;
+  TempFactor, TempCos, TempSin, TempWx, TempWy : Single;
+  TempX33, TempY33, TempX34, TempY34, TempRadius, TempMin, TempMax : Single;
+  TempNext : TBlazeRoi;
 
-  function FrameX(aX : Single) : Single;
+  // A point of the model input (pixels) -> the frame : the square is rotated
+  // around its center.
+  function FrameX(aX, aY : Single) : Single;
   begin
-    Result := TempLeft + (aX * TempFactor);
+    Result := aRoi.CX + (((aX * TempFactor) - (aRoi.Side / 2)) * TempCos)
+                      - (((aY * TempFactor) - (aRoi.Side / 2)) * TempSin);
   end;
 
-  function FrameY(aY : Single) : Single;
+  function FrameY(aX, aY : Single) : Single;
   begin
-    Result := TempTop + (aY * TempFactor);
+    Result := aRoi.CY + (((aX * TempFactor) - (aRoi.Side / 2)) * TempSin)
+                      + (((aY * TempFactor) - (aRoi.Side / 2)) * TempCos);
   end;
 
 begin
@@ -96,9 +129,9 @@ begin
 
   if (length(aLandmarks) < BLAZE_LANDMARK_SIZE) then exit;
 
-  TempLeft   := aRoi.CX - (aRoi.Side / 2);
-  TempTop    := aRoi.CY - (aRoi.Side / 2);
   TempFactor := aRoi.Side / aInputSize;
+  TempCos    := Cos(aRoi.Rotation);
+  TempSin    := Sin(aRoi.Rotation);
 
   aResult.FrameWidth  := aFrameW;
   aResult.FrameHeight := aFrameH;
@@ -108,16 +141,20 @@ begin
     begin
       TempLm := BLAZE_TO_KEYPOINT[i] * BLAZE_LANDMARK_VALUES;
 
-      aResult.Keypoints[i].X     := FrameX(aLandmarks[TempLm]);
-      aResult.Keypoints[i].Y     := FrameY(aLandmarks[TempLm + 1]);
+      aResult.Keypoints[i].X     := FrameX(aLandmarks[TempLm], aLandmarks[TempLm + 1]);
+      aResult.Keypoints[i].Y     := FrameY(aLandmarks[TempLm], aLandmarks[TempLm + 1]);
       aResult.Keypoints[i].Score := BlazeSigmoid(aLandmarks[TempLm + 3]);
 
       if aResult.Has3D then
         begin
           TempLm := BLAZE_TO_KEYPOINT[i] * 3;
 
-          // MediaPipe : x to the right, y down, z away from the camera.
-          aResult.World[i] := Vec3(aWorld[TempLm], -aWorld[TempLm + 1], -aWorld[TempLm + 2]);
+          // The world landmarks are in the rotated square : turn them back
+          // (x to the right, y down), then to our axes (y up, z to the camera).
+          TempWx := (aWorld[TempLm] * TempCos) - (aWorld[TempLm + 1] * TempSin);
+          TempWy := (aWorld[TempLm] * TempSin) + (aWorld[TempLm + 1] * TempCos);
+
+          aResult.World[i] := Vec3(TempWx, -TempWy, -aWorld[TempLm + 2]);
         end;
     end;
 
@@ -125,25 +162,23 @@ begin
 
   // Next square : centered at the body center (landmark 33), the landmark 34 is
   // on the circle that surrounds the whole body.
-  TempX33 := FrameX(aLandmarks[33 * BLAZE_LANDMARK_VALUES]);
-  TempY33 := FrameY(aLandmarks[(33 * BLAZE_LANDMARK_VALUES) + 1]);
-  TempX34 := FrameX(aLandmarks[34 * BLAZE_LANDMARK_VALUES]);
-  TempY34 := FrameY(aLandmarks[(34 * BLAZE_LANDMARK_VALUES) + 1]);
+  TempX33 := FrameX(aLandmarks[33 * BLAZE_LANDMARK_VALUES], aLandmarks[(33 * BLAZE_LANDMARK_VALUES) + 1]);
+  TempY33 := FrameY(aLandmarks[33 * BLAZE_LANDMARK_VALUES], aLandmarks[(33 * BLAZE_LANDMARK_VALUES) + 1]);
+  TempX34 := FrameX(aLandmarks[34 * BLAZE_LANDMARK_VALUES], aLandmarks[(34 * BLAZE_LANDMARK_VALUES) + 1]);
+  TempY34 := FrameY(aLandmarks[34 * BLAZE_LANDMARK_VALUES], aLandmarks[(34 * BLAZE_LANDMARK_VALUES) + 1]);
   TempRadius := Sqrt(Sqr(TempX34 - TempX33) + Sqr(TempY34 - TempY33));
 
   if (TempRadius > 1) then
     begin
-      TempSide := TempRadius * 2 * 1.25;
+      BlazeRoiFromPoints(TempX33, TempY33, TempX34, TempY34, 1.25, TempNext);
 
       if (aFrameW < aFrameH) then TempMin := aFrameW else TempMin := aFrameH;
       if (aFrameW > aFrameH) then TempMax := aFrameW else TempMax := aFrameH;
 
-      if (TempSide < (0.25 * TempMin)) then TempSide := 0.25 * TempMin;
-      if (TempSide > (1.5 * TempMax)) then TempSide := 1.5 * TempMax;
+      if (TempNext.Side < (0.25 * TempMin)) then TempNext.Side := 0.25 * TempMin;
+      if (TempNext.Side > (1.5 * TempMax)) then TempNext.Side := 1.5 * TempMax;
 
-      aNextRoi.CX   := TempX33;
-      aNextRoi.CY   := TempY33;
-      aNextRoi.Side := TempSide;
+      aNextRoi := TempNext;
     end;
 end;
 

@@ -21,6 +21,13 @@ MediaPipe 랜드마크 모델 (입력 256x256) / MediaPipe landmark model (input
 * 또는 `pose_landmark_full.tflite` (MediaPipe 저장소 `mediapipe/modules/pose_landmark/`) /
   or `pose_landmark_full.tflite` (MediaPipe repository)
 
+**포즈 검출 모델 / pose detector model** : `pose_detection.tflite`(MediaPipe 저장소 `mediapipe/modules/pose_detection/`)를
+랜드마크 모델 옆에 두세요. `pose_detector.tflite`도 됩니다. 있으면 전체 화면에서 사람을 찾고 기울어진 몸도 따라갑니다.
+`.task` 파일에는 이미 들어 있습니다. /
+Put `pose_detection.tflite` (MediaPipe repository `mediapipe/modules/pose_detection/`) next to the landmark model
+(`pose_detector.tflite` works too). With it the person is found in the whole image and a leaning body is followed.
+A `.task` file has it already.
+
 출력 : 랜드마크 195개 값, 월드 랜드마크 117개 값, 포즈 존재 값 1개 (크기로 구분). /
 Outputs : 195 landmark values, 117 world landmark values, 1 pose flag (found by size).
 

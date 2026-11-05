@@ -7,7 +7,7 @@
 3D 렌더링은 [Castle Game Engine](https://github.com/hk1207/castle-engine)을 사용합니다.
 
 * Delphi FMX, Windows, 웹캠 입력
-* 포즈 모델 선택 : **BlazePose(3D)**, **MoveNet(2D)**, **YOLO pose(2D)**, **MediaPipe(3D, Python 브리지)**
+* 포즈 모델 선택 : **BlazePose(3D, MediaPipe 파이프라인을 Delphi에서 직접 처리)**, **MoveNet(2D)**, **YOLO pose(2D)**, **MediaPipe(3D, Python 브리지)**
 * 추론 엔진 선택 : **TensorFlow Lite**(`.tflite`) 또는 **ONNX Runtime**(`.onnx`)
 * 3D 인체 모델 선택 : `ghwmaq.glb`, `GHWBodyModel.glb`(zip 그대로 사용 가능)
 
@@ -27,7 +27,8 @@
 | `src/uOnnxRuntime.pas` | ONNX Runtime C API 바인딩 (`onnxruntime.dll`을 실행 중에 로드) |
 | `src/uPoseEstimator.pas` | 포즈 모델 공통 인터페이스 |
 | `src/uMoveNet.pas` | MoveNet SinglePose (Lightning/Thunder), 2D |
-| `src/uBlazePose.pas`, `src/uBlazeDecode.pas` | BlazePose 랜드마크 모델, 3D 월드 좌표, 몸 추적 |
+| `src/uBlazePose.pas` | MediaPipe Pose 파이프라인 직접 처리 : 검출 -> 회전된 영역 -> 랜드마크 -> 추적 |
+| `src/uBlazeDetect.pas`, `src/uBlazeDecode.pas` | 검출 모델(앵커, 해석), 랜드마크 모델 해석, 회전된 영역 계산 |
 | `src/uYoloPose.pas`, `src/uYoloDecode.pas` | YOLOv8/11-pose ONNX 모델, 2D |
 | `src/uMediaPipeBridge.pas`, `src/uMediaPipeProtocol.pas` | MediaPipe(Python) 브리지 수신 (UDP) |
 | `src/uPoseModels.pas` | `.tflite`/`.onnx` 파일을 열어 모델 종류를 자동으로 판별 |
@@ -44,14 +45,30 @@
 
 | 모델 | 파일 | 출력 | 특징 |
 | --- | --- | --- | --- |
-| **BlazePose** (MediaPipe) | `.tflite` 또는 `.onnx` | 랜드마크 33개 + **3D 월드 좌표(미터)** | 깊이와 몸의 회전을 **측정**합니다. 권장 |
-| **MediaPipe 브리지** | (Python 프로그램) | 랜드마크 33개 + **3D 월드 좌표** | 공식 MediaPipe를 그대로 사용 (포즈 검출 모델 포함, 정확도 최고) |
+| **BlazePose** (MediaPipe 직접 처리) | `.tflite` 또는 `.onnx` (+ 포즈 검출 모델) | 랜드마크 33개 + **3D 월드 좌표(미터)** | 깊이와 몸의 회전을 **측정**합니다. 브리지 없이 Delphi만으로 동작. 권장 |
+| **MediaPipe 브리지** | (Python 프로그램) | 랜드마크 33개 + **3D 월드 좌표** | 공식 MediaPipe 라이브러리를 그대로 사용 |
 | **MoveNet** (Lightning/Thunder) | `.tflite` 또는 `.onnx` | 2D 키포인트 17개 | 빠르고 단순합니다. 깊이는 뼈 길이로 **추정**합니다. |
 | **YOLO pose** (v8/11) | `.onnx` | 2D 키포인트 17개 | 사람을 찾아서 측정합니다. 깊이는 **추정** |
 
 모델 종류는 출력 모양으로 자동 판별합니다. `.tflite`/`.onnx` 파일을 `models/`에 넣으면 앱이 자동으로
 찾고, 왼쪽 패널에서 고를 수 있습니다. 받는 방법은 [models/README.md](models/README.md)를 보세요.
 MediaPipe `.task` 파일도 그대로 쓸 수 있습니다.
+
+### MediaPipe 직접 처리 (Python 없이)
+
+MediaPipe Pose의 처리 과정을 Delphi로 옮겼습니다. Python도, 브리지도 필요 없습니다.
+
+1. **포즈 검출 모델**(`pose_detection.tflite`, 입력 224x224)이 전체 화면에서 사람을 찾고,
+   몸 중심과 몸을 둘러싼 원 위의 점을 줍니다 (SSD 앵커 2254개를 직접 만들어 해석).
+2. 그 두 점으로 몸 주변의 **회전된 정사각형**(1.25배)을 만들어 잘라냅니다.
+   몸이 기울거나 누워 있어도 모델에는 똑바로 선 모습이 들어갑니다.
+3. **랜드마크 모델**(`pose_landmark_*.tflite`, 입력 256x256)이 랜드마크 33개와 3D 월드 좌표를 줍니다.
+   월드 좌표는 영역의 회전만큼 되돌립니다.
+4. 다음 프레임의 영역은 이번 랜드마크(33번, 34번)로 계산합니다(추적). 몸을 놓치면 검출 모델을 다시 씁니다.
+
+검출 모델 파일(`pose_detection.tflite` 또는 `pose_detector.tflite`)을 랜드마크 모델 옆에 두면 자동으로 씁니다.
+MediaPipe `.task` 파일에는 둘 다 들어 있어서 그대로 쓸 수 있습니다. 검출 모델이 없으면 화면 가운데
+정사각형만 쓰므로 사람이 화면 가운데에 서야 합니다.
 
 ### ONNX Runtime
 
@@ -130,12 +147,13 @@ fpc -Mdelphi -Fu../src TestPose.pas
 ```
 
 TensorFlow Lite/ONNX Runtime 바인딩, UDP 수신, 카메라, Castle Game Engine 모델 로드, 폼은 Delphi + Windows가
-필요하며 **아직 컴파일하거나 실행해 보지 않았습니다.** `tools/mediapipe_bridge.py`도 MediaPipe로는
+필요하며 **아직 컴파일하거나 실행해 보지 않았습니다.** 포즈 검출 모델 해석(앵커 2254개, 회전된 영역, 회전된 이미지 자르기)은 합성 입력으로 테스트했지만 실제 모델 파일로는 확인하지 못했습니다. `tools/mediapipe_bridge.py`도 MediaPipe로는
 실행해 보지 못했고, 전송하는 줄의 형식(`--selftest`)만 Pascal 쪽 해석 코드로 테스트했습니다.
 
 ## 한계
 
-* `.tflite`/`.onnx`로 직접 실행하는 BlazePose는 포즈 검출 모델(detector)을 쓰지 않습니다 (MediaPipe 브리지는 씀). 첫 프레임은 화면 가운데 정사각형을 쓰므로
+* BlazePose를 직접 처리할 때는 한 명만 추적합니다 (MediaPipe의 `num_poses=1`과 같음). 여러 명은 지원하지 않습니다.
+* 직접 처리는 MediaPipe의 후처리 필터(랜드마크 평활화)를 쓰지 않고 앱의 One Euro 필터를 씁니다. 첫 프레임은 화면 가운데 정사각형을 쓰므로
   사람이 화면 가운데에 전신이 보이게 서야 합니다. 이후에는 몸을 따라갑니다.
 * 손가락, 발가락, 얼굴 표정은 움직이지 않습니다 (손은 팔뚝을 따라갑니다).
 * 카메라 한 대로 측정하므로 가려진 부분은 부정확합니다.

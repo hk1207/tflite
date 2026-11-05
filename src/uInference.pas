@@ -33,10 +33,10 @@ type
       /// <summary>
       /// Copies RGB bytes (aWidth x aHeight x 3, row by row) to the input
       /// tensor. The size must be the size of the model input. Float inputs get
-      /// the values 0..255 multiplied by aFloatScale (for example 1/255), byte
-      /// inputs get the bytes. The layout (HWC / CHW) is converted when needed.
+      /// the values 0..255 * aFloatScale + aFloatOffset (1/255 and 0 for 0..1,
+      /// 1/127.5 and -1 for -1..1), byte inputs get the bytes. The layout (HWC / CHW) is converted when needed.
       /// </summary>
-      procedure SetInputRGB(aRGB : PByte; aWidth, aHeight : integer; aFloatScale : Single = 1); virtual; abstract;
+      procedure SetInputRGB(aRGB : PByte; aWidth, aHeight : integer; aFloatScale : Single = 1; aFloatOffset : Single = 0); virtual; abstract;
       procedure Invoke; virtual; abstract;
 
       /// <summary>

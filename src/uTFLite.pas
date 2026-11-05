@@ -51,7 +51,7 @@ type
       /// 0..255 multiplied by aFloatScale (1/255 for BlazePose), uint8 models
       /// the bytes and int32 models the integers.
       /// </summary>
-      procedure SetInputRGB(aRGB : PByte; aWidth, aHeight : integer; aFloatScale : Single = 1); override;
+      procedure SetInputRGB(aRGB : PByte; aWidth, aHeight : integer; aFloatScale : Single = 1; aFloatOffset : Single = 0); override;
       procedure Invoke; override;
       procedure ReadOutput(aIndex : integer; out aData : TSingleArray); override;
       function  OutputCount : integer; override;
@@ -269,7 +269,7 @@ begin
   Result := length(FInputDims);
 end;
 
-procedure TTFLiteInterpreter.SetInputRGB(aRGB : PByte; aWidth, aHeight : integer; aFloatScale : Single);
+procedure TTFLiteInterpreter.SetInputRGB(aRGB : PByte; aWidth, aHeight : integer; aFloatScale : Single; aFloatOffset : Single);
 var
   TempTensor : Pointer;
   TempCount, i : integer;
@@ -284,7 +284,7 @@ begin
       begin
         SetLength(TempFloats, TempCount);
         for i := 0 to pred(TempCount) do
-          TempFloats[i] := PByte(NativeUInt(aRGB) + NativeUInt(i))^ * aFloatScale;
+          TempFloats[i] := (PByte(NativeUInt(aRGB) + NativeUInt(i))^ * aFloatScale) + aFloatOffset;
 
         CheckStatus(TensorCopyFromBuffer(TempTensor, @TempFloats[0], TempCount * SizeOf(Single)), 'CopyFromBuffer');
       end;

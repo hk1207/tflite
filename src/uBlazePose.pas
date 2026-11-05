@@ -1,34 +1,48 @@
 unit uBlazePose;
 
-// MediaPipe BlazePose with TensorFlow Lite : 33 landmarks with 3D world
-// coordinates (meters). It uses the landmark model (pose_landmark_lite / full /
-// heavy .tflite, input 256x256). The pose detector model is not used : the
-// first frame uses the square at the center of the image, so the person has to
-// stand in the middle of the image with the whole body visible. Then the square
-// follows the body (like the tracking of MediaPipe).
+// MediaPipe BlazePose with TensorFlow Lite or ONNX Runtime : 33 landmarks with
+// 3D world coordinates (meters). It follows the pose graph of MediaPipe :
 //
-// Outputs are found by their size : 195 values = landmarks, 117 values = world
-// landmarks, 1 value = pose presence.
+//   * the pose detector (pose_detection.tflite / pose_detector.tflite, input
+//     224x224) finds the body in the whole frame and gives the center and the
+//     size of the body,
+//   * a rotated square around the body is given to the landmark model
+//     (pose_landmark_lite / full / heavy, input 256x256),
+//   * then the square is calculated from the landmarks of the previous frame
+//     (tracking) and the detector is not used again until the body is lost.
+//
+// If there is no detector model the first frame uses the square at the center of
+// the image : the person has to stand in the middle with the whole body visible.
+//
+// The outputs of the models are found by their size : landmark model 195 values
+// = landmarks, 117 = world landmarks, 1 = pose presence; detector 27048 values
+// = regressors, 2254 = scores.
 
 interface
 
 uses
-  System.SysUtils, uInference, uPoseSolver, uPoseEstimator, uBlazeDecode;
+  System.SysUtils, uInference, uPoseSolver, uPoseEstimator, uBlazeDecode, uBlazeDetect;
 
 type
   TBlazePose = class(TPoseEstimator)
     protected
       FInterpreter : TInferenceEngine;
+      FDetector    : TInferenceEngine;
       FInputSize   : integer;
       FInput       : TBytes;
+      FDetInput    : TBytes;
       FLandmarksIdx, FWorldIdx, FPresenceIdx : integer;
+      FRegressorsIdx, FScoresIdx : integer;
+      FAnchors     : TBlazeAnchors;
       FRoi         : TBlazeRoi;
       FTracking    : boolean;
+
+      function Detect(aFrame : Pointer; aW, aH, aPitch : integer; aBGRA : boolean) : boolean;
     public
       /// <summary>
-      /// The estimator owns aInterpreter.
+      /// The estimator owns aLandmarkEngine and aDetectorEngine (nil = no detector).
       /// </summary>
-      constructor Create(aInterpreter : TInferenceEngine);
+      constructor Create(aLandmarkEngine : TInferenceEngine; aDetectorEngine : TInferenceEngine = nil);
       destructor  Destroy; override;
 
       function Name : string; override;
@@ -39,6 +53,10 @@ type
       /// True if aInterpreter looks like a BlazePose landmark model.
       /// </summary>
       class function IsBlazePose(aInterpreter : TInferenceEngine) : boolean;
+      /// <summary>
+      /// True if aInterpreter looks like the BlazePose detector model.
+      /// </summary>
+      class function IsBlazeDetector(aInterpreter : TInferenceEngine) : boolean;
   end;
 
 implementation
@@ -57,13 +75,31 @@ begin
       Result := True;
 end;
 
-constructor TBlazePose.Create(aInterpreter : TInferenceEngine);
+class function TBlazePose.IsBlazeDetector(aInterpreter : TInferenceEngine) : boolean;
+var
+  i : integer;
+  TempRegressors, TempScores : boolean;
+begin
+  TempRegressors := False;
+  TempScores     := False;
+
+  for i := 0 to pred(aInterpreter.OutputCount) do
+    begin
+      if (aInterpreter.OutputValueCount(i) = BLAZE_DETECTOR_ANCHORS * BLAZE_DETECTOR_VALUES) then TempRegressors := True;
+      if (aInterpreter.OutputValueCount(i) = BLAZE_DETECTOR_ANCHORS) then TempScores := True;
+    end;
+
+  Result := TempRegressors and TempScores;
+end;
+
+constructor TBlazePose.Create(aLandmarkEngine : TInferenceEngine; aDetectorEngine : TInferenceEngine);
 var
   i, TempCount : integer;
 begin
   inherited Create;
 
-  FInterpreter := aInterpreter;
+  FInterpreter := aLandmarkEngine;
+  FDetector    := aDetectorEngine;
 
   if (FInterpreter.InputWidth <= 0) or (FInterpreter.InputWidth <> FInterpreter.InputHeight) then
     raise EInferenceError.Create('This is not a BlazePose landmark model (the input must be a square image)');
@@ -92,27 +128,85 @@ begin
   if (FLandmarksIdx < 0) then
     raise EInferenceError.Create('This is not a BlazePose landmark model (no output with 195 values)');
 
+  FRegressorsIdx := -1;
+  FScoresIdx     := -1;
+
+  if (FDetector <> nil) then
+    begin
+      if not(IsBlazeDetector(FDetector)) or (FDetector.InputWidth <> BLAZE_DETECTOR_SIZE) or
+         (FDetector.InputHeight <> BLAZE_DETECTOR_SIZE) then
+        raise EInferenceError.Create('This is not the BlazePose detector model (input 224x224, outputs 2254 x 12 and 2254)');
+
+      for i := 0 to pred(FDetector.OutputCount) do
+        begin
+          TempCount := FDetector.OutputValueCount(i);
+
+          if (TempCount = BLAZE_DETECTOR_ANCHORS * BLAZE_DETECTOR_VALUES) then FRegressorsIdx := i;
+          if (TempCount = BLAZE_DETECTOR_ANCHORS) then FScoresIdx := i;
+        end;
+
+      SetLength(FDetInput, BLAZE_DETECTOR_SIZE * BLAZE_DETECTOR_SIZE * 3);
+      BlazeBuildAnchors(FAnchors);
+    end;
+
   FTracking := False;
 end;
 
 destructor TBlazePose.Destroy;
 begin
   FInterpreter.Free;
+  FDetector.Free;
 
   inherited Destroy;
 end;
 
 function TBlazePose.Name : string;
+var
+  TempDetector : string;
 begin
-  if (FWorldIdx >= 0) then
-    Result := Format('BlazePose %dx%d (3D)', [FInputSize, FInputSize])
+  if (FDetector <> nil) then
+    TempDetector := ' + detector'
    else
-    Result := Format('BlazePose %dx%d (no world output)', [FInputSize, FInputSize]);
+    TempDetector := '';
+
+  if (FWorldIdx >= 0) then
+    Result := Format('BlazePose %dx%d%s (3D)', [FInputSize, FInputSize, TempDetector])
+   else
+    Result := Format('BlazePose %dx%d%s (no world output)', [FInputSize, FInputSize, TempDetector]);
 end;
 
 procedure TBlazePose.ResetTracking;
 begin
   FTracking := False;
+end;
+
+// Pose detector : finds the body in the whole frame and sets FRoi.
+function TBlazePose.Detect(aFrame : Pointer; aW, aH, aPitch : integer; aBGRA : boolean) : boolean;
+var
+  TempSquare : TBlazeRoi;
+  TempRegressors, TempScores : TSingleArray;
+  TempScore : Single;
+begin
+  BlazeFullFrameRoi(aW, aH, TempSquare);
+
+  if (FDetector = nil) then
+    begin
+      // No detector model : the person is supposed to be at the center.
+      FRoi   := TempSquare;
+      Result := True;
+      exit;
+    end;
+
+  // The frame in a black square 224x224, values -1..1
+  CropRegionToRGB(aFrame, aW, aH, aPitch, aBGRA, TempSquare.CX, TempSquare.CY, TempSquare.Side,
+                  @FDetInput[0], BLAZE_DETECTOR_SIZE);
+
+  FDetector.SetInputRGB(@FDetInput[0], BLAZE_DETECTOR_SIZE, BLAZE_DETECTOR_SIZE, 1 / 127.5, -1);
+  FDetector.Invoke;
+  FDetector.ReadOutput(FRegressorsIdx, TempRegressors);
+  FDetector.ReadOutput(FScoresIdx, TempScores);
+
+  Result := BlazeDetectPose(TempRegressors, TempScores, FAnchors, TempSquare, 0.5, FRoi, TempScore);
 end;
 
 function TBlazePose.Estimate(aFrame : Pointer; aW, aH, aPitch : integer; aBGRA : boolean) : TPoseResult;
@@ -126,9 +220,10 @@ begin
   Result.FrameHeight := aH;
 
   if not(FTracking) then
-    BlazeFullFrameRoi(aW, aH, FRoi);
+    if not(Detect(aFrame, aW, aH, aPitch, aBGRA)) then exit;
 
-  CropRegionToRGB(aFrame, aW, aH, aPitch, aBGRA, FRoi.CX, FRoi.CY, FRoi.Side, @FInput[0], FInputSize);
+  CropRotatedToRGB(aFrame, aW, aH, aPitch, aBGRA, FRoi.CX, FRoi.CY, FRoi.Side, FRoi.Rotation,
+                   @FInput[0], FInputSize);
 
   // The landmark model wants float values 0..1
   FInterpreter.SetInputRGB(@FInput[0], FInputSize, FInputSize, 1 / 255);
@@ -151,7 +246,7 @@ begin
 
       if (TempFlag < 0.5) then
         begin
-          // The body was lost : search again in the whole image.
+          // The body was lost : search it again with the detector.
           FTracking := False;
           exit;
         end;
@@ -163,7 +258,9 @@ begin
     begin
       FRoi      := TempNext;
       FTracking := True;
-    end;
+    end
+   else
+    FTracking := False;
 end;
 
 end.

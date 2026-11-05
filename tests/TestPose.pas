@@ -8,7 +8,7 @@ program TestPose;
 {$APPTYPE CONSOLE}
 
 uses
-  SysUtils, Math, uPoseSolver, uPoseImage, uPoseRig, uRigFixtures, uPoseEstimator, uBlazeDecode, uYoloDecode, uMediaPipeProtocol;
+  SysUtils, Math, uPoseSolver, uPoseImage, uPoseRig, uRigFixtures, uPoseEstimator, uBlazeDecode, uYoloDecode, uMediaPipeProtocol, uBlazeDetect;
 
 var
   Failures : integer = 0;
@@ -253,6 +253,11 @@ var
   TempWorld : array[0..116] of Single;
   TempRoi, TempRoi2 : TBlazeRoi;
   TempRes : TPoseResult;
+  TempAnchors : TBlazeAnchors;
+  TempReg : array[0..(2254 * 12) - 1] of Single;
+  TempScores : array[0..2253] of Single;
+  TempScore : Single;
+  TempRoi3 : TBlazeRoi;
   TempFile : TextFile;
   TempLine : string;
   TempYolo : array[0..(3 * 56) - 1] of Single;
@@ -537,6 +542,76 @@ begin
         Near(TempRoi2.Side, 100 * 2.8125 * 2 * 1.25, 0.1));
   BlazeDecode(TempLm, TempWorld[0..10], 256, TempRoi, 1280, 720, TempRes, TempRoi2);
   Check('blaze without world', TempRes.Found and not(TempRes.Has3D));
+
+  // ---- BlazePose detector : anchors, decoding, rotated square ----
+  BlazeBuildAnchors(TempAnchors);
+  Check('2254 anchors', length(TempAnchors) = BLAZE_DETECTOR_ANCHORS);
+  Check('first anchor', Near(TempAnchors[0].X, 0.5 / 28, 0.0001) and Near(TempAnchors[0].Y, 0.5 / 28, 0.0001));
+  // layer 1 (stride 8) has 28 x 28 x 2 anchors, the second anchor of a cell has the same center
+  Check('2 anchors per cell', Near(TempAnchors[1].X, TempAnchors[0].X, 0.0001));
+  Check('second cell', Near(TempAnchors[2].X, 1.5 / 28, 0.0001));
+  // stride 16 layer starts at 1568 : 14 x 14 cells
+  Check('stride 16 layer', Near(TempAnchors[1568].X, 0.5 / 14, 0.0001) and Near(TempAnchors[1570].X, 1.5 / 14, 0.0001));
+  // stride 32 layers start at 1568 + 392 = 1960 : 7 x 7 cells with 6 anchors
+  Check('stride 32 layers', Near(TempAnchors[1960].X, 0.5 / 7, 0.0001) and Near(TempAnchors[1966].X, 1.5 / 7, 0.0001));
+  Check('last anchor', Near(TempAnchors[2253].X, 6.5 / 7, 0.0001) and Near(TempAnchors[2253].Y, 6.5 / 7, 0.0001));
+
+  FillChar(TempReg, SizeOf(TempReg), 0);
+  FillChar(TempScores, SizeOf(TempScores), 0);
+  for i := 0 to 2253 do TempScores[i] := -10;
+  TempScores[1000] := 5;
+  // center of the body at +0.1, +0.2 of the anchor, the second point 0.3 above it
+  TempReg[(1000 * 12) + 4] := 0.1 * 224;
+  TempReg[(1000 * 12) + 5] := 0.2 * 224;
+  TempReg[(1000 * 12) + 6] := 0.1 * 224;
+  TempReg[(1000 * 12) + 7] := (0.2 - 0.3) * 224;
+  BlazeFullFrameRoi(1280, 720, TempRoi);
+  Check('detector finds the person', BlazeDetectPose(TempReg, TempScores, TempAnchors, TempRoi, 0.5, TempRoi2, TempScore) and
+        (TempScore > 0.99));
+  // square 720 at x = 280 : center x = 280 + (anchor + 0.1) * 720
+  Check('detector center', Near(TempRoi2.CX, 280 + ((TempAnchors[1000].X + 0.1) * 720), 0.01) and
+        Near(TempRoi2.CY, (TempAnchors[1000].Y + 0.2) * 720, 0.01));
+  Check('detector side', Near(TempRoi2.Side, 0.3 * 720 * 2 * 1.25, 0.01));
+  Check('detector upright body : no rotation', Near(TempRoi2.Rotation, 0, 0.001));
+  TempScores[1000] := -10;
+  Check('detector nobody', not(BlazeDetectPose(TempReg, TempScores, TempAnchors, TempRoi, 0.5, TempRoi2, TempScore)));
+
+  // Rotation of the square : the body leans to the right (the second point is up and to the right)
+  BlazeRoiFromPoints(100, 100, 200, 0, 1.25, TempRoi2);
+  Check('roi leaning to the right', Near(TempRoi2.Rotation, Pi / 4, 0.001));
+  Check('roi side', Near(TempRoi2.Side, 2 * Sqrt(20000) * 1.25, 0.01));
+  BlazeRoiFromPoints(100, 100, 0, 0, 1.25, TempRoi2);
+  Check('roi leaning to the left', Near(TempRoi2.Rotation, -Pi / 4, 0.001));
+  BlazeRoiFromPoints(100, 100, 100, 200, 1.25, TempRoi2);
+  Check('roi upside down', Near(Abs(TempRoi2.Rotation), Pi, 0.001));
+
+  // The landmarks follow the rotation : model "up" of a roi rotated by 90 degrees clockwise is to the right of the image
+  FillChar(TempLm, SizeOf(TempLm), 0);
+  FillChar(TempWorld, SizeOf(TempWorld), 0);
+  TempRoi2.CX := 500; TempRoi2.CY := 400; TempRoi2.Side := 256; TempRoi2.Rotation := Pi / 2;
+  // nose (landmark 0) at the top center of the model input (128, 0)
+  TempLm[0] := 128; TempLm[1] := 0; TempLm[3] := 8;
+  TempLm[(33 * 5) + 0] := 128; TempLm[(33 * 5) + 1] := 128;
+  TempLm[(34 * 5) + 0] := 128; TempLm[(34 * 5) + 1] := 28;
+  // world : the nose 0.5 m above the hips in the model (y down => -0.5)
+  TempWorld[1] := -0.5;
+  BlazeDecode(TempLm, TempWorld, 256, TempRoi2, 1280, 720, TempRes, TempRoi3);
+  Check('rotated roi : keypoint', Near(TempRes.Keypoints[KP_NOSE].X, 500 + 128, 0.01) and Near(TempRes.Keypoints[KP_NOSE].Y, 400, 0.01),
+        FloatToStr(TempRes.Keypoints[KP_NOSE].X) + ' ' + FloatToStr(TempRes.Keypoints[KP_NOSE].Y));
+  // the world vector (0, -0.5) is turned 90 degrees clockwise : to the right of the image (+X)
+  Check('rotated roi : world', Near(TempRes.World[KP_NOSE].X, 0.5, 0.001) and Near(TempRes.World[KP_NOSE].Y, 0, 0.001));
+  Check('rotated roi : next roi rotation', Near(TempRoi3.Rotation, Pi / 2, 0.001));
+
+  // ---- Rotated crop of the image ----
+  FillChar(TempSrc, SizeOf(TempSrc), 0);
+  // a bright pixel at the top of the 8x6 image, row 0, x = 4
+  TempSrc[(0 * 8 + 4) * 4 + 0] := 250; TempSrc[(0 * 8 + 4) * 4 + 1] := 250; TempSrc[(0 * 8 + 4) * 4 + 2] := 250;
+  CropRotatedToRGB(@TempSrc[0], 8, 6, 8 * 4, True, 4, 3, 6, 0, @TempDst[0], 4);
+  Check('rotated crop : no rotation keeps the top', TempDst[((0 * 4) + 2) * 3] > 100);
+  CropRotatedToRGB(@TempSrc[0], 8, 6, 8 * 4, True, 4, 3, 6, Pi / 2, @TempDst[0], 4);
+  // rotated 90 degrees clockwise : the top of the frame is at the left of the model image
+  Check('rotated crop : 90 degrees', TempDst[((1 * 4) + 0) * 3] > 100);
+  Check('rotated crop : 90 degrees, not at the top', TempDst[((0 * 4) + 2) * 3] < 50);
 
   // ---- MediaPipe bridge protocol (line made by tools/mediapipe_bridge.py --selftest) ----
   AssignFile(TempFile, 'mediapipe_line.txt');
