@@ -1,0 +1,24 @@
+# Delphi
+*.dcu
+*.exe
+*.dll
+*.bpl
+*.dcp
+*.map
+*.local
+*.identcache
+*.stat
+*.res
+*.dsk
+__history/
+__recovery/
+Win32/
+Win64/
+
+# Models and DLLs are downloaded by the user
+*.tflite
+
+# Free Pascal test build
+*.o
+*.ppu
+tests/TestPose
